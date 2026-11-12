@@ -169,8 +169,8 @@ and pages scroll.
 
 | Setting | What it does |
 | --- | --- |
-| Drive folder | Where the drive lives. Default: `%USERPROFILE%\OpenCfDrive`. |
-| rclone remote | The remote to show, such as `myremote:` or `myremote:backup`. |
+| Drives | Every drive: its folder and its remote. **Add drive** starts another one; each gets its own place in Explorer. |
+| rclone remote | The remote the chosen drive shows, such as `myremote:` or `myremote:backup`. |
 | rclone | **OpenCfDrive runs it** (the default), or **I run rclone rcd myself** at the address you give. |
 | rclone program | A specific `rclone.exe`. Leave it empty to use the one on `PATH`, or else the downloaded copy. |
 | rclone config file | A specific `rclone.conf`. Leave it empty for rclone's own default (`rclone config file` tells you where that is). |
@@ -181,6 +181,12 @@ Settings are saved in `%LOCALAPPDATA%\OpenCfDrive\settings.json`. Developers
 and scripts can override some of them with environment variables (see
 [Development](development.md#configuration)). The app tells you when one is
 set.
+
+**Several drives.** Each drive has its own folder, remote, sync state and
+place in Explorer's navigation pane; they share one rclone. The notification
+icon stands for the drive that is doing worst: its headline says which one
+when something is wrong. With several drives, the Status page and the icon's
+menu show the first; removing or moving a drive restarts them all for a moment.
 
 **Changing the drive folder or the remote.** A drive folder belongs to one
 remote, because its placeholders describe that remote's files. So the app only

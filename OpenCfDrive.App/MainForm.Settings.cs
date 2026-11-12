@@ -12,6 +12,9 @@ namespace OpenCfDrive.App;
 /// </summary>
 internal sealed partial class MainForm
 {
+    private readonly ComboBox _rootBox = new() { Anchor = AnchorStyles.Left | AnchorStyles.Right, DropDownStyle = ComboBoxStyle.DropDownList, AccessibleName = "drive", Margin = new Padding(0, 4, 0, 4) };
+    private readonly Button _addRoot = Theme.Button("Add drive");
+    private readonly Button _removeRoot = Theme.Button("Remove");
     private readonly ComboBox _remoteBox = new() { Anchor = AnchorStyles.Left | AnchorStyles.Right, DropDownStyle = ComboBoxStyle.DropDown, AccessibleName = "rclone remote", Margin = new Padding(0, 4, 8, 4) };
     private readonly Label _remoteDetails = Theme.Hint();
     private readonly TextBox _folderBox = Input("Drive folder");
@@ -49,6 +52,11 @@ internal sealed partial class MainForm
 
     private FieldSet? _loaded;
     private bool _loading;
+    // The drives being edited, as (folder, remote) pairs; one of them is in
+    // the fields below the picker at a time.
+    private List<(string Folder, string Remote)> _draftRoots = [];
+    private int _rootIndex;
+    private bool _fillingRootBox;
 
     private static TextBox Input(string name, string? placeholder = null) => new()
     {
@@ -87,8 +95,22 @@ internal sealed partial class MainForm
             }
         };
 
-        // The drive: what it shows, and where.
+        _addRoot.Click += (_, _) => AddRoot();
+        _removeRoot.Click += (_, _) => RemoveRoot();
+        _rootBox.SelectedIndexChanged += (_, _) =>
+        {
+            if (!_fillingRootBox && !_loading)
+            {
+                SwitchRoot();
+            }
+        };
+
+        // The drive(s): what each shows, and where.
         var drive = new Card(3);
+        var rootTools = new WrapRow();
+        rootTools.Controls.AddRange([_addRoot, _removeRoot]);
+        drive.AddRow(Theme.FieldCaption("Drive"), _rootBox);
+        drive.AddIndented(rootTools);
         drive.AddRow(Theme.FieldCaption("Remote"), _remoteBox, refresh);
         drive.AddIndented(_remoteDetails);
         drive.AddIndented(Theme.Hint(
@@ -99,6 +121,8 @@ internal sealed partial class MainForm
         drive.AddIndented(Theme.Hint(
             "Where the drive appears in Explorer. Moving it, or choosing another remote, needs a new or empty folder; " +
             "the old one stays as an ordinary folder with the files already downloaded."));
+        drive.AddIndented(Theme.Hint(
+            "Add another drive to sync a second folder with its own remote; each gets its own place in Explorer."));
 
         // rclone: the program OpenCfDrive runs, or the rclone rcd the user runs.
         var rclone = new Card(3);
@@ -187,6 +211,12 @@ internal sealed partial class MainForm
             input.TextChanged += (_, _) => FieldsChanged();
         }
 
+        // The fields describe the drive picked in the box above them.
+        foreach (var input in new Control[] { _folderBox, _remoteBox })
+        {
+            input.TextChanged += (_, _) => KeepRootDraft();
+        }
+
         _rcUrlBox.TextChanged += (_, _) => ShowRcdCommand();
         _rcUserBox.TextChanged += (_, _) => ShowRcdCommand();
         _signIn.CheckedChanged += (_, _) => FieldsChanged();
@@ -261,7 +291,8 @@ internal sealed partial class MainForm
     private void ShowSaveButtons()
     {
         var idle = _busy is null && !_app.Busy;
-        _save.Enabled = idle && (Edited || _snapshot?.Saved.Remote is null);
+        var neverSetUp = _snapshot?.Saved.Remote is null && _snapshot?.Saved.Roots is not { Count: > 0 };
+        _save.Enabled = idle && (Edited || neverSetUp);
         _discard.Enabled = idle && Edited;
     }
 
@@ -356,14 +387,162 @@ internal sealed partial class MainForm
             : $"Set in your environment, so the service uses those values instead of these: {string.Join(", ", overridden)}.";
     }
 
+    // --- the drive list --------------------------------------------------------
+
+    /// <summary>The picker's text for a drive: its folder's name and its remote.</summary>
+    private static string RootItemText((string Folder, string Remote) root)
+    {
+        var name = Path.GetFileName(Path.TrimEndingDirectorySeparator(
+            string.IsNullOrWhiteSpace(root.Folder) ? "?" : root.Folder.Trim()));
+        return string.IsNullOrWhiteSpace(root.Remote) ? $"{name} (no remote)" : $"{name} — {root.Remote}";
+    }
+
+    /// <summary>Fills the picker from <see cref="_draftRoots"/> and selects the edited drive.</summary>
+    private void FillRootBox()
+    {
+        _fillingRootBox = true;
+        try
+        {
+            _rootBox.Items.Clear();
+            foreach (var root in _draftRoots)
+            {
+                _rootBox.Items.Add(RootItemText(root));
+            }
+
+            _rootBox.SelectedIndex = Math.Clamp(_rootIndex, 0, Math.Max(0, _draftRoots.Count - 1));
+        }
+        finally
+        {
+            _fillingRootBox = false;
+        }
+    }
+
+    /// <summary>The fields now describe another drive: the old one keeps what they held.</summary>
+    private void SwitchRoot()
+    {
+        if (_rootIndex < _draftRoots.Count)
+        {
+            _draftRoots[_rootIndex] = (_folderBox.Text, _remoteBox.Text);
+        }
+
+        _rootIndex = _rootBox.SelectedIndex;
+        LoadRootFields();
+    }
+
+    /// <summary>Shows the edited drive in the fields, and whether it can be removed.</summary>
+    private void LoadRootFields()
+    {
+        _loading = true;
+        try
+        {
+            var (folder, remote) = _draftRoots[Math.Clamp(_rootIndex, 0, _draftRoots.Count - 1)];
+            _folderBox.Text = folder;
+            _remoteBox.Text = remote;
+        }
+        finally
+        {
+            _loading = false;
+        }
+
+        _removeRoot.Enabled = _draftRoots.Count > 1;
+    }
+
+    /// <summary>What the fields say goes back into the edited drive (and its line in the picker).</summary>
+    private void KeepRootDraft()
+    {
+        if (_loading || _rootIndex >= _draftRoots.Count)
+        {
+            return;
+        }
+
+        _draftRoots[_rootIndex] = (_folderBox.Text, _remoteBox.Text);
+        var text = RootItemText(_draftRoots[_rootIndex]);
+        if (_rootBox.SelectedIndex == _rootIndex && _rootBox.Items[_rootIndex] is { } item && (string)item != text)
+        {
+            _fillingRootBox = true;
+            try
+            {
+                _rootBox.Items[_rootIndex] = text;
+            }
+            finally
+            {
+                _fillingRootBox = false;
+            }
+        }
+    }
+
+    /// <summary>A folder no other drive has, under the user's profile.</summary>
+    private string DefaultFolder()
+    {
+        var profile = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+        for (var n = 1; ; n++)
+        {
+            var candidate = Path.Combine(profile, n == 1 ? "OpenCfDrive" : $"OpenCfDrive {n}");
+            if (_draftRoots.All(root => !string.Equals(root.Folder.Trim(), candidate, StringComparison.OrdinalIgnoreCase)))
+            {
+                return candidate;
+            }
+        }
+    }
+
+    private void AddRoot()
+    {
+        KeepRootDraft();
+        _draftRoots.Add((DefaultFolder(), ""));
+        _rootIndex = _draftRoots.Count - 1;
+        FillRootBox();
+        LoadRootFields();
+        FieldsChanged();
+    }
+
+    private void RemoveRoot()
+    {
+        if (_draftRoots.Count <= 1)
+        {
+            return;
+        }
+
+        var folder = _draftRoots[_rootIndex].Folder;
+        if (MessageBox.Show(
+                this,
+                $"'{folder}' is removed when you save: it is taken out of Explorer's navigation pane and stays as an " +
+                "ordinary folder with the files already downloaded.",
+                "Remove the drive",
+                MessageBoxButtons.OKCancel,
+                MessageBoxIcon.Information) != DialogResult.OK)
+        {
+            return;
+        }
+
+        _draftRoots.RemoveAt(_rootIndex);
+        _rootIndex = Math.Min(_rootIndex, _draftRoots.Count - 1);
+        FillRootBox();
+        LoadRootFields();
+        FieldsChanged();
+    }
+
+    // --- loading and saving ------------------------------------------------------
+
     private void LoadSettings(DriveSnapshot snapshot)
     {
         _loading = true;
         try
         {
             var saved = snapshot.Saved;
-            _folderBox.Text = saved.SyncRoot ?? snapshot.Settings.SyncRoot.Value;
-            _remoteBox.Text = saved.Remote ?? "";
+            if (saved.Roots is { Count: > 0 } list)
+            {
+                _draftRoots = list.Select(root => (root.SyncRoot, root.Remote ?? "")).ToList();
+            }
+            else
+            {
+                _draftRoots = [(saved.SyncRoot ?? snapshot.Settings.SyncRoot.Value, saved.Remote ?? "")];
+            }
+
+            _rootIndex = 0;
+            FillRootBox();
+            var first = _draftRoots[0];
+            _folderBox.Text = first.Folder;
+            _remoteBox.Text = first.Remote;
             _rcUrlBox.Text = saved.RcUrl ?? DriveSettingsFile.DefaultRcUrl;
             _rcUserBox.Text = saved.RcUser ?? "";
             _rcPasswordBox.Text = UserSecret.Unprotect(saved.RcPasswordProtected) ?? "";
@@ -385,6 +564,7 @@ internal sealed partial class MainForm
             }
 
             ShowRcloneMode();
+            _removeRoot.Enabled = _draftRoots.Count > 1;
             _remoteBox.Select(_remoteBox.Text.Length, 0); // not all of it selected, as setting it leaves it
             _loaded = FieldValues;
 
@@ -411,16 +591,19 @@ internal sealed partial class MainForm
 
     /// <summary>What the Settings fields hold, to tell whether the user changed any.</summary>
     private sealed record FieldSet(
-        string Folder, string Remote, string RcUrl, string RcUser, string RcPassword, bool SignIn, bool AutoUpdate, bool ManageRclone,
-        string Program, string Config)
+        string Roots, string Folder, string Remote, string RcUrl, string RcUser, string RcPassword, bool SignIn, bool AutoUpdate,
+        bool ManageRclone, string Program, string Config)
     {
         /// <summary>Never the password.</summary>
-        public override string ToString() => $"{nameof(FieldSet)} {{ Folder = {Folder}, Remote = {Remote}, RcUrl = {RcUrl}, RcUser = {RcUser} }}";
+        public override string ToString() => $"{nameof(FieldSet)} {{ Roots = {Roots}, Folder = {Folder}, Remote = {Remote}, RcUrl = {RcUrl}, RcUser = {RcUser} }}";
     }
 
+    /// <summary>Every drive in one string, so a change to any of them counts.</summary>
+    private string RootsText => string.Join("\n", _draftRoots.Select(root => $"{root.Folder}|{root.Remote}"));
+
     private FieldSet FieldValues => new(
-        _folderBox.Text, _remoteBox.Text, _rcUrlBox.Text, _rcUserBox.Text, _rcPasswordBox.Text, _signIn.Checked, _autoUpdate.Checked,
-        _manageRclone.Checked, _programBox.Text, _configBox.Text);
+        RootsText, _folderBox.Text, _remoteBox.Text, _rcUrlBox.Text, _rcUserBox.Text, _rcPasswordBox.Text, _signIn.Checked,
+        _autoUpdate.Checked, _manageRclone.Checked, _programBox.Text, _configBox.Text);
 
     /// <summary>The fields differ from what was loaded into them: the user is editing.</summary>
     private bool Edited => _loaded is { } loaded && loaded != FieldValues;
@@ -543,8 +726,8 @@ internal sealed partial class MainForm
             return;
         }
 
-        var root = _folderBox.Text.Trim();
-        var remote = _remoteBox.Text.Trim();
+        KeepRootDraft();
+        var roots = _draftRoots.Select(root => (Folder: root.Folder.Trim(), Remote: root.Remote.Trim())).ToList();
         var rcUrl = _rcUrlBox.Text.Trim();
         var rcUser = Blank(_rcUserBox.Text);
         var rcPassword = _rcPasswordBox.Text;
@@ -553,27 +736,43 @@ internal sealed partial class MainForm
         var config = Blank(_configBox.Text);
 
         string? invalid = null;
-        if (!Path.IsPathFullyQualified(root))
+        foreach (var (folder, remote) in roots)
         {
-            invalid = "The drive folder must be a full path, like C:\\Users\\you\\OpenCfDrive.";
+            if (!Path.IsPathFullyQualified(folder))
+            {
+                invalid = $"The drive folder must be a full path, like C:\\Users\\you\\OpenCfDrive: '{folder}'.";
+            }
+            else if (remote.Length == 0 || remote.StartsWith(':'))
+            {
+                invalid = $"Choose an rclone remote for '{folder}', like myremote:.";
+            }
+
+            if (invalid is not null)
+            {
+                break;
+            }
         }
-        else if (remote.Length == 0 || remote.StartsWith(':'))
+
+        var twice = roots
+            .GroupBy(root => root.Folder, StringComparer.OrdinalIgnoreCase)
+            .FirstOrDefault(group => group.Count() > 1)?.Key;
+        if (invalid is null && twice is not null)
         {
-            invalid = "Choose an rclone remote, like myremote:.";
+            invalid = $"Each drive needs its own folder; '{twice}' is chosen twice.";
         }
-        else if (managed && program is not null && !File.Exists(program))
+        else if (invalid is null && managed && program is not null && !File.Exists(program))
         {
             invalid = $"There is no rclone program at {program}.";
         }
-        else if (managed && config is not null && !File.Exists(config))
+        else if (invalid is null && managed && config is not null && !File.Exists(config))
         {
             invalid = $"There is no rclone config file at {config}.";
         }
-        else if (!managed && (!Uri.TryCreate(rcUrl, UriKind.Absolute, out var uri) || uri.Scheme is not ("http" or "https")))
+        else if (invalid is null && !managed && (!Uri.TryCreate(rcUrl, UriKind.Absolute, out var uri) || uri.Scheme is not ("http" or "https")))
         {
             invalid = "The remote control address must be an http:// address, like http://127.0.0.1:5572.";
         }
-        else if (!managed && (rcUser is null || rcPassword.Length == 0))
+        else if (invalid is null && !managed && (rcUser is null || rcPassword.Length == 0))
         {
             invalid = "Enter the user and password your rclone rcd was started with (--rc-user and --rc-pass).";
         }
@@ -586,8 +785,11 @@ internal sealed partial class MainForm
 
         var settings = snapshot.Saved with
         {
-            SyncRoot = root,
-            Remote = remote,
+            Roots = roots.Select(root => new DriveRoot(root.Folder, root.Remote)).ToList(),
+            // The first drive also in the old single-drive places, so a copy
+            // from before several drives were a thing still syncs it.
+            SyncRoot = roots[0].Folder,
+            Remote = roots[0].Remote,
             RcUrl = rcUrl,
             RcUser = rcUser,
             RcPasswordProtected = rcUser is null || rcPassword.Length == 0 ? null : UserSecret.Protect(rcPassword),
@@ -599,26 +801,50 @@ internal sealed partial class MainForm
         };
         var before = snapshot.Settings;
         var after = DriveSettingsFile.Resolve(settings);
-        var change = DriveChange.Check(before.SyncRoot.Value, before.Remote.Value, after.SyncRoot.Value, after.Remote.Value);
-        if (!change.Allowed)
+
+        // One check per drive: a folder that was another remote's drive
+        // before, or a new folder that is not empty, is refused. A drive the
+        // list no longer has only needs unregistering.
+        var changes = new List<DriveChange>();
+        foreach (var (folder, remote) in roots)
         {
-            ShowSaveResult(change.Problem!, Theme.Problem);
+            var current = before.Roots.FirstOrDefault(root =>
+                string.Equals(root.SyncRoot, folder, StringComparison.OrdinalIgnoreCase));
+            changes.Add(DriveChange.Check(folder, current?.Remote, folder, remote));
+        }
+
+        foreach (var gone in before.Roots.Where(root =>
+                     roots.All(chosen => !string.Equals(chosen.Folder, root.SyncRoot, StringComparison.OrdinalIgnoreCase))))
+        {
+            changes.Add(new DriveChange(true, null, gone.SyncRoot, gone.Remote, gone.SyncRoot, DiscardOldState: false));
+        }
+
+        var refused = changes.FirstOrDefault(change => !change.Allowed);
+        if (refused is not null)
+        {
+            ShowSaveResult(refused.Problem!, Theme.Problem);
             return;
         }
 
-        if (change.OldSyncRootToUnregister is { } oldRoot &&
-            MessageBox.Show(
+        var moved = changes.Select(change => change.OldSyncRootToUnregister).OfType<string>().Distinct().ToList();
+        if (moved.Count > 0)
+        {
+            var list = string.Join("\n", moved);
+            var said = MessageBox.Show(
                 this,
-                $"The drive moves to {change.NewSyncRoot}.\n\n{oldRoot} stops being a drive: it is removed from " +
-                "Explorer's navigation pane and stays as an ordinary folder with the files already downloaded.",
+                (moved.Count == 1 ? $"{moved[0]} stops being a drive" : "These folders stop being drives") +
+                $":\n\n{list}\n\n" +
+                "Each is removed from Explorer's navigation pane and stays as an ordinary folder with the files already downloaded.",
                 "Move the drive",
                 MessageBoxButtons.OKCancel,
-                MessageBoxIcon.Information) != DialogResult.OK)
-        {
-            return;
+                MessageBoxIcon.Information);
+            if (said != DialogResult.OK)
+            {
+                return;
+            }
         }
 
-        var problem = await _app.ApplySettingsAsync(settings, change);
+        var problem = await _app.ApplySettingsAsync(settings, changes);
         if (problem is null)
         {
             if (_app.Latest is { } latest)

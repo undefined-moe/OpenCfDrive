@@ -375,7 +375,7 @@ public sealed class MainFormLayoutTests
 
         public Task RestartAsync() => Task.CompletedTask;
 
-        public Task<string?> ApplySettingsAsync(DriveSettings settings, DriveChange change) => Task.FromResult<string?>(null);
+        public Task<string?> ApplySettingsAsync(DriveSettings settings, IReadOnlyList<DriveChange> changes) => Task.FromResult<string?>(null);
 
         public Task<string?> DownloadRcloneAsync(IProgress<string> progress) => Task.FromResult<string?>(null);
 

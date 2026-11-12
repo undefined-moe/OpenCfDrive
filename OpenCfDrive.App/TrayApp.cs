@@ -38,7 +38,7 @@ internal sealed class TrayApp : ApplicationContext, IDriveApp
     private DriveIndicator? _indicatorShown;
     private MainForm? _window;
     private Action? _balloonClicked;
-    private bool _watching;
+    private readonly HashSet<string> _watching = new(StringComparer.OrdinalIgnoreCase);
     private bool _busy;
     private bool _exiting;
 
@@ -225,20 +225,26 @@ internal sealed class TrayApp : ApplicationContext, IDriveApp
 
     /// <summary>
     /// While the service runs, it tells the app each change as it happens
-    /// (see <see cref="ServiceControl.WatchAsync"/>), so the icon shows
-    /// syncing when it starts and stops, not at the next refresh. Once the
-    /// service ends, the app looks again at once, and watches the next one;
-    /// one that does not answer is tried again at the next refresh.
+    /// (see <see cref="ServiceControl.WatchAsync"/>), once per drive, so the
+    /// icon shows syncing when it starts and stops, not at the next refresh.
+    /// Once the service ends, the app looks again at once, and watches the
+    /// next one; one that does not answer is tried again at the next refresh.
     /// </summary>
     private void Watch(DriveSnapshot snapshot)
     {
-        if (_watching || _exiting || snapshot.Status is null)
+        if (_exiting)
         {
             return;
         }
 
-        _watching = true;
-        _ = WatchAsync(snapshot.Settings.SyncRoot.Value);
+        foreach (var root in snapshot.Roots)
+        {
+            if (root.Running && !_watching.Contains(root.SyncRoot))
+            {
+                _watching.Add(root.SyncRoot);
+                _ = WatchAsync(root.SyncRoot);
+            }
+        }
     }
 
     private async Task WatchAsync(string syncRoot)
@@ -247,11 +253,11 @@ internal sealed class TrayApp : ApplicationContext, IDriveApp
         try
         {
             heard = await ServiceControl.WatchAsync(
-                syncRoot, pulse => _ui.Post(_ => OnPulse(pulse), null), TimeSpan.FromSeconds(2), _closing.Token);
+                syncRoot, pulse => _ui.Post(_ => OnPulse(syncRoot, pulse), null), TimeSpan.FromSeconds(2), _closing.Token);
         }
         finally
         {
-            _watching = false;
+            _watching.Remove(syncRoot);
         }
 
         if (heard && !_exiting)
@@ -265,15 +271,16 @@ internal sealed class TrayApp : ApplicationContext, IDriveApp
     /// a new sync problem, also reads the whole status, which says more
     /// (and notifies the user).
     /// </summary>
-    private void OnPulse(ServicePulse pulse)
+    private void OnPulse(string syncRoot, ServicePulse pulse)
     {
         if (_exiting)
         {
             return;
         }
 
-        var before = Monitor.Latest?.Status;
-        Monitor.Apply(pulse);
+        var before = Monitor.Latest?.Roots
+            .FirstOrDefault(root => string.Equals(root.SyncRoot, syncRoot, StringComparison.OrdinalIgnoreCase))?.Status;
+        Monitor.Apply(syncRoot, pulse);
         if (before is not null && before.ProcessId == pulse.ProcessId &&
             (pulse.State != before.State || pulse.ProblemsReported != before.ProblemsReported))
         {
@@ -317,8 +324,12 @@ internal sealed class TrayApp : ApplicationContext, IDriveApp
     {
         var latest = Monitor.Latest;
         var (_, headline, _) = latest?.Summary ?? (Health.Idle, "Checking...", "");
-        _headline.Text = latest?.Settings.HasRemote == true ? $"{headline}: {latest.Settings.Remote.Value}" : headline;
-        _openFolder.Enabled = latest is not null && Directory.Exists(latest.Settings.SyncRoot.Value);
+        var roots = latest?.Roots ?? [];
+        var several = roots.Count > 1;
+        _headline.Text = latest?.Settings.HasRemote == true
+            ? (several ? $"{headline}: {roots.Count} drives" : $"{headline}: {latest.Settings.Remote.Value}")
+            : headline;
+        _openFolder.Enabled = roots.Any(root => Directory.Exists(root.SyncRoot));
 
         var running = latest?.Running ?? false;
         _start.Enabled = !_busy && latest is { Running: false, SettingsProblem: null } && latest.Settings.HasRemote;
@@ -390,7 +401,7 @@ internal sealed class TrayApp : ApplicationContext, IDriveApp
         }
 
         if (Monitor.Latest is { Running: true } latest &&
-            await RunAsync("Stopping syncing for the update", () => SyncService.StopAsync(latest.Settings.SyncRoot.Value)) is not null)
+            await RunAsync("Stopping syncing for the update", () => SyncService.StopAsync(RootPaths(latest))) is not null)
         {
             return;
         }
@@ -445,6 +456,10 @@ internal sealed class TrayApp : ApplicationContext, IDriveApp
         _window.Activate();
     }
 
+    /// <summary>The folders of every configured drive: what one service process runs.</summary>
+    private static IReadOnlyList<string> RootPaths(DriveSnapshot snapshot) =>
+        snapshot.Settings.Roots.Select(root => root.SyncRoot).ToArray();
+
     public async Task StartAsync()
     {
         var latest = Monitor.Latest;
@@ -453,7 +468,7 @@ internal sealed class TrayApp : ApplicationContext, IDriveApp
             return;
         }
 
-        await RunAsync("Starting", () => SyncService.StartAsync(latest.Settings.SyncRoot.Value));
+        await RunAsync("Starting", () => SyncService.StartAsync(RootPaths(latest)));
     }
 
     public async Task StopAsync()
@@ -464,7 +479,7 @@ internal sealed class TrayApp : ApplicationContext, IDriveApp
             return;
         }
 
-        await RunAsync("Stopping", () => SyncService.StopAsync(latest.Settings.SyncRoot.Value));
+        await RunAsync("Stopping", () => SyncService.StopAsync(RootPaths(latest)));
     }
 
     public async Task RestartAsync()
@@ -475,47 +490,59 @@ internal sealed class TrayApp : ApplicationContext, IDriveApp
             return;
         }
 
-        var root = latest.Settings.SyncRoot.Value;
-        await RunAsync("Restarting", async () => await SyncService.StopAsync(root) ?? await SyncService.StartAsync(root));
+        var roots = RootPaths(latest);
+        await RunAsync("Restarting", async () => await SyncService.StopAsync(roots) ?? await SyncService.StartAsync(roots));
     }
 
     /// <summary>
     /// Saves new settings and carries them out: a moved drive is unregistered
     /// from its old folder (left as an ordinary folder), and a running service
-    /// restarts with them. Returns why it could not, or null.
+    /// restarts with them. One change per drive (see <see cref="DriveChange"/>).
+    /// Returns why it could not, or null.
     /// </summary>
-    public async Task<string?> ApplySettingsAsync(DriveSettings settings, DriveChange change)
+    public async Task<string?> ApplySettingsAsync(DriveSettings settings, IReadOnlyList<DriveChange> changes)
     {
         var before = Monitor.Latest!.Settings;
         var after = DriveSettingsFile.Resolve(settings);
-        var syncChanged =
-            !string.Equals(before.SyncRoot.Value, after.SyncRoot.Value, StringComparison.OrdinalIgnoreCase) ||
-            before.Remote.Value != after.Remote.Value ||
+        var rcloneChanged =
             before.ManageRclone != after.ManageRclone ||
             (after.ManageRclone
                 ? before.RclonePath != after.RclonePath || before.RcloneConfig != after.RcloneConfig
                 : before.RcUrl.Value != after.RcUrl.Value || before.RcUser != after.RcUser || before.RcPassword != after.RcPassword);
+        // The list of drives itself: a drive added, removed, moved or pointed
+        // at another remote needs the service restarted to be picked up; the
+        // service reads the settings once, as it starts.
+        var rootsChanged =
+            after.Roots.Count != before.Roots.Count ||
+            changes.Any(change => change.ChangesDrive) ||
+            after.Roots.Any(chosen => !before.Roots.Any(current =>
+                string.Equals(current.SyncRoot, chosen.SyncRoot, StringComparison.OrdinalIgnoreCase) &&
+                current.Remote == chosen.Remote));
+        var syncChanged = rootsChanged || rcloneChanged;
 
         return await RunAsync("Applying the settings", async () =>
         {
-            if (syncChanged && await SyncService.StopAsync(before.SyncRoot.Value) is { } notStopped)
+            if (syncChanged && await SyncService.StopAsync(RootPaths(Monitor.Latest!)) is { } notStopped)
             {
                 return notStopped;
             }
 
             // First, while nothing else has changed yet: the state of a folder
             // that held another remote's drive no longer applies.
-            if (change.DiscardOldState)
+            foreach (var change in changes.Where(change => change.DiscardOldState))
             {
-                SqliteMetadataStore.Delete(SyncStatePaths.DatabasePath(after.SyncRoot.Value));
+                SqliteMetadataStore.Delete(SyncStatePaths.DatabasePath(change.NewSyncRoot));
             }
 
-            if (change.OldSyncRootToUnregister is { } oldRoot && SyncRootRegistrar.IsSyncRoot(oldRoot))
+            foreach (var oldRoot in changes.Select(change => change.OldSyncRootToUnregister).OfType<string>().Distinct())
             {
-                var result = await Task.Run(() => new SyncRootRegistrar().Unregister(oldRoot));
-                if (!result.Success)
+                if (SyncRootRegistrar.IsSyncRoot(oldRoot))
                 {
-                    return $"The old drive folder could not be unregistered: {result.Message}";
+                    var result = await Task.Run(() => new SyncRootRegistrar().Unregister(oldRoot));
+                    if (!result.Success)
+                    {
+                        return $"The old drive folder could not be unregistered: {result.Message}";
+                    }
                 }
             }
 
@@ -530,7 +557,7 @@ internal sealed class TrayApp : ApplicationContext, IDriveApp
             }
 
             return syncChanged && after.HasRemote
-                ? await SyncService.StartAsync(after.SyncRoot.Value)
+                ? await SyncService.StartAsync(after.Roots.Select(root => root.SyncRoot).ToArray())
                 : null;
         }, report: false);
     }
@@ -560,10 +587,10 @@ internal sealed class TrayApp : ApplicationContext, IDriveApp
                 return null;
             }
 
-            var root = latest.Settings.SyncRoot.Value;
+            var roots = RootPaths(latest);
             return latest.Status?.Rclone?.State is "NotFound" or "Failed"
-                ? await SyncService.StopAsync(root) ?? await SyncService.StartAsync(root)
-                : latest.Running ? null : await SyncService.StartAsync(root);
+                ? await SyncService.StopAsync(roots) ?? await SyncService.StartAsync(roots)
+                : latest.Running ? null : await SyncService.StartAsync(roots);
         }, report: false);
     }
 
@@ -655,8 +682,9 @@ internal sealed class TrayApp : ApplicationContext, IDriveApp
 
     public void OpenFolder()
     {
-        var root = Monitor.Latest?.Settings.SyncRoot.Value;
-        if (root is not null && Directory.Exists(root))
+        // With several drives, the first one (which the window headlines).
+        var root = Monitor.Latest?.Roots.Select(r => r.SyncRoot).FirstOrDefault(Directory.Exists);
+        if (root is not null)
         {
             Process.Start(new ProcessStartInfo(root) { UseShellExecute = true })?.Dispose();
         }

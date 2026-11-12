@@ -11,6 +11,9 @@ internal enum Health
     Problem,
 }
 
+/// <summary>One drive at one moment: whether its service runs and what it last said.</summary>
+internal sealed record RootStatus(string SyncRoot, string Remote, bool Running, ServiceStatus? Status);
+
 /// <summary>Everything the app shows, read at one moment.</summary>
 internal sealed record DriveSnapshot(
     DriveSettings Saved,
@@ -19,12 +22,17 @@ internal sealed record DriveSnapshot(
     bool Running,
     ServiceStatus? Status,
     RcloneProbeResult? Rclone,
-    RemoteInfo? RemoteInfo)
+    RemoteInfo? RemoteInfo,
+    IReadOnlyList<RootStatus>? MoreRoots = null)
 {
+    /// <summary>Every configured drive; the first is the one the Settings page edits first and the window headlines.</summary>
+    public IReadOnlyList<RootStatus> Roots =>
+        MoreRoots ?? [new(Settings.SyncRoot.Value, Remote, Running, Status)];
+
     /// <summary>The remote the service syncs with, or would once started.</summary>
     public string Remote => Status?.Remote ?? Settings.Remote.Value;
 
-    /// <summary>One word for the tray and the window's header, and a sentence on it.</summary>
+    /// <summary>One word for the tray and the window's header, and a sentence on it: the worst of the drives.</summary>
     public (Health Health, string Headline, string Detail) Summary
     {
         get
@@ -51,46 +59,92 @@ internal sealed record DriveSnapshot(
                 return (Health.Busy, "Running", "The sync service runs, but has not reported its status.");
             }
 
-            // The rclone the service runs itself reports through the service.
-            var ownRclone = Status.Rclone is { Managed: true } own ? own : null;
-            var (health, headline, detail) = Status.State switch
+            // Each drive says how it is doing; the worst one is what the one
+            // icon and one headline stand for, with its name when there are
+            // several and it has something to say.
+            var worstRoot = WorstRoot();
+            var worst = SummaryOf(worstRoot);
+            if (Roots.Count > 1 && worst.Health != Health.Good)
             {
-                ServiceState.Starting => (Health.Busy, "Starting", Status.Detail),
-                ServiceState.Offline => (Health.Busy, "Offline", $"{Status.Detail} {Status.Activity?.Describe()}".TrimEnd()),
-                ServiceState.Unavailable => (Health.Problem, "Cloud Files unavailable", Status.Detail),
-                ServiceState.Failed when ownRclone?.State == "NotFound" => (Health.Problem, "rclone not found", Status.Detail),
-                ServiceState.Failed => (Health.Problem, "Problem", Status.Detail),
-                _ when ownRclone is { State: not "Running" } => (Health.Problem, "rclone stopped", ownRclone.Detail),
-                _ when ownRclone is null && Rclone is { Usable: false } => (Health.Problem, "rclone unreachable", Rclone.Problem ?? ""),
-                _ => Connected(Status),
-            };
+                worst = (worst.Health, worst.Headline, $"{NameOf(worstRoot.SyncRoot)}: {worst.Detail}");
+            }
+
+            // The rclone the service runs itself reports through the service;
+            // a stopped rclone is every drive's problem, so no drive's name.
+            var ownRclone = Status.Rclone is { Managed: true } own ? own : null;
+            if (worst.Health != Health.Problem && ownRclone is { State: not "Running" })
+            {
+                worst = (Health.Problem, "rclone stopped", ownRclone.Detail);
+            }
+            else if (worst.Health != Health.Problem && ownRclone is null && Rclone is { Usable: false })
+            {
+                worst = (Health.Problem, "rclone unreachable", Rclone.Problem ?? "");
+            }
 
             return RunsWithOtherSettings
-                ? (health, headline, $"{detail} Restart it to use the saved settings.")
-                : (health, headline, detail);
+                ? (worst.Health, worst.Headline, $"{worst.Detail} Restart it to use the saved settings.")
+                : worst;
         }
     }
 
-    /// <summary>What the notification area icon shows.</summary>
-    public DriveIndicator Indicator =>
-        DriveIndicators.Of(Summary.Health == Health.Problem, Running, Settings.HasRemote, Status);
-
-    /// <summary>A connected drive: syncing, up to date, or with files that could not be synced.</summary>
-    private static (Health Health, string Headline, string Detail) Connected(ServiceStatus status)
+    /// <summary>What one drive's own status says about it.</summary>
+    private (Health Health, string Headline, string Detail) SummaryOf(RootStatus root)
     {
-        if (status.Activity is not { } activity)
+        if (root.Status is null)
         {
-            return (Health.Good, "Running", status.Detail); // a service from before activity was reported
+            return (Health.Busy, "Starting", "The drive is registering and connecting.");
         }
 
-        if (activity.Busy)
+        var ownRclone = root.Status.Rclone is { Managed: true } own ? own : null;
+        return root.Status.State switch
         {
-            return (Health.Good, "Syncing", activity.Describe());
+            ServiceState.Starting => (Health.Busy, "Starting", root.Status.Detail),
+            ServiceState.Offline => (Health.Busy, "Offline", $"{root.Status.Detail} {root.Status.Activity?.Describe()}".TrimEnd()),
+            ServiceState.Unavailable => (Health.Problem, "Cloud Files unavailable", root.Status.Detail),
+            ServiceState.Failed when ownRclone?.State == "NotFound" => (Health.Problem, "rclone not found", root.Status.Detail),
+            ServiceState.Failed => (Health.Problem, "Problem", root.Status.Detail),
+            _ when root.Status.Activity is not { } activity => (Health.Good, "Running", root.Status.Detail),
+            _ when activity.Busy => (Health.Good, "Syncing", activity.Describe()),
+            _ => activity.Failing > 0
+                ? (Health.Busy, activity.Failing == 1 ? "1 file not synced" : $"{activity.Failing:N0} files not synced", activity.Describe())
+                : (Health.Good, "Up to date", root.Status.Detail),
+        };
+    }
+
+    private static int Rank(Health health) => health switch
+    {
+        Health.Problem => 3,
+        Health.Busy => 2,
+        Health.Good => 1,
+        _ => 0,
+    };
+
+    private static string NameOf(string folder) =>
+        Path.GetFileName(Path.TrimEndingDirectorySeparator(folder));
+
+    /// <summary>What the notification area icon shows: the worst of the drives.</summary>
+    public DriveIndicator Indicator
+    {
+        get
+        {
+            var worst = WorstRoot();
+            return DriveIndicators.Of(Summary.Health == Health.Problem, Running, Settings.HasRemote, worst.Status ?? Status);
+        }
+    }
+
+    /// <summary>The drive in the worst shape: what the icon and the headline stand for.</summary>
+    private RootStatus WorstRoot()
+    {
+        var worst = Roots[0];
+        foreach (var root in Roots.Skip(1))
+        {
+            if (Rank(SummaryOf(root).Health) > Rank(SummaryOf(worst).Health))
+            {
+                worst = root;
+            }
         }
 
-        return activity.Failing > 0
-            ? (Health.Busy, activity.Failing == 1 ? "1 file not synced" : $"{activity.Failing:N0} files not synced", activity.Describe())
-            : (Health.Good, "Up to date", status.Detail);
+        return worst;
     }
 
     /// <summary>The service started before the settings in effect now were saved.</summary>
@@ -98,6 +152,8 @@ internal sealed record DriveSnapshot(
         Status is not null &&
         (!string.Equals(Status.SyncRoot, Settings.SyncRoot.Value, StringComparison.OrdinalIgnoreCase) ||
          !string.Equals(Status.Remote, Settings.Remote.Value, StringComparison.Ordinal) ||
+         Roots.Any(root => root.Status is { } status &&
+             !string.Equals(status.Remote, root.Remote, StringComparison.Ordinal)) ||
          (Status.Rclone?.Managed ?? true) != Settings.ManageRclone ||
          (!Settings.ManageRclone && !string.Equals(Status.RcUrl, Settings.RcUrl.Value, StringComparison.OrdinalIgnoreCase)));
 }
@@ -110,7 +166,7 @@ internal sealed class DriveMonitor
 {
     private static readonly TimeSpan ProgramCheckInterval = TimeSpan.FromSeconds(30);
 
-    private ServicePulse? _pulse;
+    private readonly Dictionary<string, ServicePulse> _pulses = new(StringComparer.OrdinalIgnoreCase);
     private bool _refreshing;
     private (TimeSpan Rclone, TimeSpan Remote)? _again;
     private bool _describing;
@@ -129,17 +185,50 @@ internal sealed class DriveMonitor
     public event Action<DriveSnapshot>? Pulsed;
 
     /// <summary>
-    /// What the watched service said since the last read: kept in
-    /// <see cref="Latest"/> unless a newer read already has it.
+    /// What the watched service said about one drive since the last read:
+    /// kept in <see cref="Latest"/> unless a newer read already has it.
     /// </summary>
-    public void Apply(ServicePulse pulse)
+    public void Apply(string syncRoot, ServicePulse pulse)
     {
-        _pulse = pulse;
-        if (Latest is { Status: { } status } latest && status.With(pulse) is var merged && !ReferenceEquals(merged, status))
+        _pulses[syncRoot] = pulse;
+        if (Latest is not { } latest)
         {
-            Latest = latest with { Status = merged };
-            Pulsed?.Invoke(Latest);
+            return;
         }
+
+        var changed = false;
+        var roots = new List<RootStatus>(latest.Roots.Count);
+        foreach (var root in latest.Roots)
+        {
+            if (root.Status is { } status &&
+                string.Equals(root.SyncRoot, syncRoot, StringComparison.OrdinalIgnoreCase) &&
+                status.With(pulse) is { } merged && !ReferenceEquals(merged, status))
+            {
+                roots.Add(root with { Status = merged });
+                changed = true;
+            }
+            else
+            {
+                roots.Add(root);
+            }
+        }
+
+        if (!changed)
+        {
+            return;
+        }
+
+        // The headline status is the first running drive's; it follows that
+        // drive's pulse too.
+        var pulsed = roots.First(root => string.Equals(root.SyncRoot, syncRoot, StringComparison.OrdinalIgnoreCase));
+        Latest = latest with
+        {
+            MoreRoots = roots,
+            Status = string.Equals(latest.Status?.SyncRoot, syncRoot, StringComparison.OrdinalIgnoreCase)
+                ? pulsed.Status
+                : latest.Status,
+        };
+        Pulsed?.Invoke(Latest);
     }
 
     /// <param name="rcloneMaxAge">How old rclone's last answer may be before it is asked again.</param>
@@ -169,10 +258,20 @@ internal sealed class DriveMonitor
             }
 
             var settings = DriveSettingsFile.Resolve(saved);
-            var running = ServiceControl.IsRunning(settings.SyncRoot.Value);
-            var status = running
-                ? (await ServiceControl.GetStatusAsync(settings.SyncRoot.Value, TimeSpan.FromSeconds(2)))?.With(_pulse)
-                : null;
+
+            // One status per configured drive, from its own pipe.
+            var roots = new List<RootStatus>(settings.Roots.Count);
+            foreach (var root in settings.Roots)
+            {
+                var running = ServiceControl.IsRunning(root.SyncRoot);
+                var status = running
+                    ? (await ServiceControl.GetStatusAsync(root.SyncRoot, TimeSpan.FromSeconds(2)))?.With(_pulses.GetValueOrDefault(root.SyncRoot))
+                    : null;
+                roots.Add(new RootStatus(root.SyncRoot, root.Remote, running, status));
+            }
+
+            var anyRunning = roots.Exists(root => root.Running);
+            var primary = roots.FirstOrDefault(root => root.Running) ?? roots[0];
 
             // Asking the rclone program means running it a few times; the
             // service reports its own rclone's state live anyway.
@@ -189,9 +288,11 @@ internal sealed class DriveMonitor
                 _rcloneCheckedAt = DateTime.UtcNow;
             }
 
-            var snapshot = new DriveSnapshot(saved, problem, settings, running, status, rclone, null);
+            var snapshot = new DriveSnapshot(
+                saved, problem, settings, anyRunning, primary.Status, rclone, null,
+                roots.Count == 1 ? null : roots);
             var described = Latest?.RemoteInfo;
-            var known = (settings.HasRemote || running) && rclone.Usable;
+            var known = (settings.HasRemote || anyRunning) && rclone.Usable;
             Latest = snapshot with { RemoteInfo = known && described?.Remote == snapshot.Remote ? described : null };
             Updated?.Invoke(Latest);
 

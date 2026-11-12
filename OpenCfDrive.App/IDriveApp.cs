@@ -26,8 +26,8 @@ internal interface IDriveApp
 
     Task RestartAsync();
 
-    /// <summary>Saves and carries out new settings; returns why it could not, or null.</summary>
-    Task<string?> ApplySettingsAsync(DriveSettings settings, DriveChange change);
+    /// <summary>Saves and carries out new settings, one change per drive; returns why it could not, or null.</summary>
+    Task<string?> ApplySettingsAsync(DriveSettings settings, IReadOnlyList<DriveChange> changes);
 
     /// <summary>Downloads rclone from rclone.org; returns why it could not, or null.</summary>
     Task<string?> DownloadRcloneAsync(IProgress<string> progress);

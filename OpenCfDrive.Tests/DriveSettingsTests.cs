@@ -129,6 +129,64 @@ public sealed class DriveSettingsTests : IDisposable
         Assert.Equal("box:backup", effective.Remote.Value);
     }
 
+    [Fact]
+    public void Roots_RoundTrip()
+    {
+        var saved = new DriveSettings
+        {
+            Roots = [new DriveRoot(@"D:\One", "box:"), new DriveRoot(@"D:\Two", "s3:photos/")],
+        };
+
+        DriveSettingsFile.Save(saved, SettingsPath);
+
+        Assert.Equal(saved.Roots, DriveSettingsFile.Load(SettingsPath).Roots);
+    }
+
+    [Fact]
+    public void Resolve_WithSeveralRoots_ListsThemAll_AndLeadsWithTheFirst()
+    {
+        var saved = new DriveSettings
+        {
+            SyncRoot = @"D:\OldPlace",
+            Remote = "old:",
+            Roots = [new DriveRoot(@"D:\One", "box:"), new DriveRoot(@"D:\Two", "s3:photos/")],
+        };
+
+        var effective = DriveSettingsFile.Resolve(saved, _ => null);
+
+        Assert.Equal(2, effective.Roots.Count);
+        Assert.Equal(@"D:\One", effective.Roots[0].SyncRoot);
+        Assert.Equal("box:", effective.Roots[0].Remote);
+        Assert.Equal(@"D:\Two", effective.Roots[1].SyncRoot);
+        Assert.Equal("s3:photos", effective.Roots[1].Remote); // normalised like the first
+        // The first root is also what the single-drive places report.
+        Assert.Equal(@"D:\One", effective.SyncRoot.Value);
+        Assert.Equal("box:", effective.Remote.Value);
+    }
+
+    [Fact]
+    public void Resolve_WithoutRoots_IsOneDrive_AsBefore()
+    {
+        var effective = DriveSettingsFile.Resolve(new DriveSettings { SyncRoot = @"D:\One", Remote = "box:" }, _ => null);
+
+        var root = Assert.Single(effective.Roots);
+        Assert.Equal(@"D:\One", root.SyncRoot);
+        Assert.Equal("box:", root.Remote);
+    }
+
+    [Fact]
+    public void Resolve_SkipsAnExtraRoot_WithoutARemote()
+    {
+        var saved = new DriveSettings
+        {
+            Roots = [new DriveRoot(@"D:\One", "box:"), new DriveRoot(@"D:\Two", null)],
+        };
+
+        var effective = DriveSettingsFile.Resolve(saved, _ => null);
+
+        Assert.Single(effective.Roots);
+    }
+
     public void Dispose()
     {
         try

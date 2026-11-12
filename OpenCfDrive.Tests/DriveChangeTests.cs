@@ -45,6 +45,20 @@ public sealed class DriveChangeTests : IDisposable
     }
 
     [Fact]
+    public void ANewAddedDrive_WithoutACurrentRemote_CallsItANewDrive_NotARemoteChange()
+    {
+        var folder = Path.Combine(_folder, "second");
+        Directory.CreateDirectory(folder);
+        File.WriteAllText(Path.Combine(folder, "something.txt"), "in the way");
+
+        var change = DriveChange.Check(folder, null, folder, "dropbox:", _syncRoots.Contains, root => _states.GetValueOrDefault(root));
+
+        Assert.False(change.Allowed);
+        Assert.Contains("not empty", change.Problem);
+        Assert.DoesNotContain("another remote", change.Problem);
+    }
+
+    [Fact]
     public void AnotherRemote_InTheSameFolder_IsAllowed_WhenTheDriveTracksNothing()
     {
         _states[Current] = new DriveState("e2e:", 0);

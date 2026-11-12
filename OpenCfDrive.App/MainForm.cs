@@ -304,8 +304,11 @@ internal sealed partial class MainForm : Form
         using var batch = Theme.OneLayout(this);
         _snapshot = snapshot;
         var remote = snapshot.Settings.HasRemote || snapshot.Status is not null ? snapshot.Remote : null;
-        _driveRemote.Text = remote is null ? "Not set up" : Shortened(remote);
-        _tips.SetToolTip(_driveRemote, remote);
+        var more = snapshot.Roots.Count - 1;
+        _driveRemote.Text = remote is null
+            ? "Not set up"
+            : more > 0 ? $"{Shortened(remote)} +{more}" : Shortened(remote);
+        _tips.SetToolTip(_driveRemote, remote is null ? null : string.Join("\n", snapshot.Roots.Select(root => root.Remote)));
         ShowIndicator(snapshot);
         ShowStatus(snapshot);
         ShowAbout(snapshot);

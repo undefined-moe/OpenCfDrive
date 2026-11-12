@@ -148,16 +148,22 @@ internal sealed partial class MainForm
         _setUp.Visible = !snapshot.Running && (!setUp || health == Health.Problem);
         _setUp.Text = setUp ? "Open Settings" : "Choose a remote";
         _openFolder.Visible = setUp || snapshot.Running;
-        _openFolder.Enabled = Directory.Exists(snapshot.Settings.SyncRoot.Value);
+        _openFolder.Enabled = snapshot.Roots.Any(root => Directory.Exists(root.SyncRoot));
         _start.Visible = setUp && !snapshot.Running;
         _start.Enabled = idle && snapshot.SettingsProblem is null;
         _stop.Visible = _restart.Visible = snapshot.Running;
         _stop.Enabled = _restart.Enabled = idle;
 
+        // shortcut: several drives show the first, with how many more there
+        // are; one list with each drive's own state is not built yet.
         var root = snapshot.Status?.SyncRoot ?? snapshot.Settings.SyncRoot.Value;
-        _folder.Text = root;
+        var more = snapshot.Roots.Count - 1;
+        _folder.Text = more > 0 ? $"{root} (+{more})" : root;
         _folder.LinkArea = Directory.Exists(root) ? new LinkArea(0, root.Length) : new LinkArea(0, 0);
-        _remote.Text = setUp || snapshot.Status is not null ? snapshot.Remote : "None chosen yet";
+        _tips.SetToolTip(_folder, more > 0 ? string.Join("\n", snapshot.Roots.Select(r => r.SyncRoot)) : null);
+        _remote.Text = setUp || snapshot.Status is not null
+            ? (more > 0 ? $"{snapshot.Remote} (+{more})" : snapshot.Remote)
+            : "None chosen yet";
         (_storage.Text, _space.Text) = snapshot.RemoteInfo is { } info
             ? (info.Kind ?? info.Problem ?? "-", info.Problem is null ? SpaceText(info) : "-")
             : snapshot.Rclone is { Usable: true } && (setUp || snapshot.Status is not null)

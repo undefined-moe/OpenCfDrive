@@ -13,20 +13,52 @@ public sealed class SyncWorker(
     IHostApplicationLifetime lifetime) : BackgroundService
 {
     private readonly DateTimeOffset _startedAt = DateTimeOffset.Now;
-    private readonly ProblemLog _problems = new();
-    private CloudSyncEngine? _engine;
-    private SqliteMetadataStore? _store;
-    private ServiceControlServer? _control;
-    private EffectiveSettings? _settings;
-    private SyncRootStatus? _initialized;
+    private readonly List<RootDrive> _drives = [];
     private RcloneDaemon? _daemon;
     private RcloneStatus? _rcloneStatus;
-    private volatile ServiceState _state = ServiceState.Starting;
-    private volatile string _detail = "Registering and connecting the drive.";
+    private EffectiveSettings? _settings;
 
-    // The number of the last change a pulse shows; a watching app keeps
-    // whichever of a pulse and a status is newer.
-    private long _revision = 1;
+    /// <summary>
+    /// One drive: its own state database, control pipe, engine and problems.
+    /// A drive that fails to start or sync does not stop the others.
+    /// </summary>
+    private sealed class RootDrive(EffectiveRoot root)
+    {
+        public string SyncRoot { get; } = root.SyncRoot;
+
+        public string Remote { get; } = root.Remote;
+
+        public SqliteMetadataStore Store = null!;
+
+        public ServiceControlServer? Control;
+
+        public CloudSyncEngine? Engine;
+
+        public SyncRootStatus? Initialized;
+
+        public ProblemLog Problems { get; } = new();
+
+        public (ServiceState State, string Detail) State { get; set; } = (ServiceState.Starting, "Registering and connecting the drive.");
+
+        // The number of the last change a pulse shows; a watching app keeps
+        // whichever of a pulse and a status is newer.
+        public long Revision = 1;
+
+        /// <summary>Something a pulse shows has changed: it is numbered, and sent to a watching app.</summary>
+        public void Changed()
+        {
+            Interlocked.Increment(ref Revision);
+            Control?.NotifyChanged();
+        }
+
+        /// <summary>The state to report: a connected drive whose server cannot be reached is offline.</summary>
+        public (ServiceState State, string Detail) StateNow() =>
+            State.State == ServiceState.Syncing && Engine is { IsOnline: false } engine
+                ? (ServiceState.Offline,
+                   $"The server cannot be reached ({engine.OfflineReason}). Folders show what is on this PC, and changes " +
+                   "are sent once it answers; it is checked again when the network changes, when the drive is used, and every minute or so.")
+                : State;
+    }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
@@ -44,12 +76,15 @@ public sealed class SyncWorker(
         // Explicit environment values win, which keeps scripted runs deterministic.
         var settings = DriveSettingsFile.Resolve(saved);
         _settings = settings;
-        var syncRoot = settings.SyncRoot.Value;
-        var remote = settings.Remote.Value;
         var rcUrl = settings.RcUrl.Value;
         logger.LogInformation(
-            "Drive '{SyncRoot}' for {Remote} through {Rclone} (settings: {SettingsPath})",
-            syncRoot, remote, settings.ManageRclone ? "an rclone it runs itself" : $"the rclone at {rcUrl}", DriveSettingsFile.Path);
+            "{Count} drive(s) through {Rclone} (settings: {SettingsPath})",
+            settings.Roots.Count, settings.ManageRclone ? "an rclone it runs itself" : $"the rclone at {rcUrl}", DriveSettingsFile.Path);
+        foreach (var root in settings.Roots)
+        {
+            logger.LogInformation("Drive '{SyncRoot}' for {Remote}", root.SyncRoot, root.Remote);
+        }
+
         foreach (var (retired, replacement) in DriveSettingsFile.RetiredVariables)
         {
             if (!string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable(retired)))
@@ -60,12 +95,65 @@ public sealed class SyncWorker(
 
         if (!settings.HasRemote)
         {
-            logger.LogWarning("No rclone remote is configured, so '{Remote}' is used. Choose one in the OpenCfDrive app.", remote);
+            logger.LogWarning("No rclone remote is configured, so '{Remote}' is used. Choose one in the OpenCfDrive app.", settings.Remote.Value);
         }
 
-        // Engine state never lives in the sync root: everything under that path
+        // Engine state never lives in a sync root: everything under that path
         // is user data and is watched/uploaded.
         Directory.CreateDirectory(SyncStatePaths.StateRoot);
+
+        // Each drive's state database and control pipe first: even when
+        // rclone below cannot be started, the app can ask every drive why.
+        foreach (var root in settings.Roots)
+        {
+            var drive = new RootDrive(root);
+            _drives.Add(drive);
+            try
+            {
+                PrepareDrive(drive, settings);
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                logger.LogError(ex, "Drive '{SyncRoot}' could not open its state", drive.SyncRoot);
+                drive.State = (ServiceState.Failed, ex.Message);
+            }
+        }
+
+        // One rclone remote control for every drive: its API takes the
+        // remote per request.
+        var endpoint = await ConnectRcloneAsync(settings, stoppingToken).ConfigureAwait(false);
+        if (endpoint is null)
+        {
+            // Nothing to sync with; stay up so the app can say why.
+            await WaitUntilStoppedAsync(stoppingToken).ConfigureAwait(false);
+            return;
+        }
+
+        foreach (var drive in _drives)
+        {
+            if (drive.State.State == ServiceState.Failed)
+            {
+                continue; // its state or pipe could not be set up above
+            }
+
+            try
+            {
+                await StartEngineAsync(drive, endpoint, stoppingToken).ConfigureAwait(false);
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                logger.LogError(ex, "Drive '{SyncRoot}' could not start", drive.SyncRoot);
+                drive.State = (ServiceState.Failed, ex.Message);
+            }
+        }
+
+        await WaitUntilStoppedAsync(stoppingToken).ConfigureAwait(false);
+    }
+
+    /// <summary>One drive's state database and control pipe, before any syncing.</summary>
+    private void PrepareDrive(RootDrive drive, EffectiveSettings settings)
+    {
+        var syncRoot = drive.SyncRoot;
         var dbPath = SyncStatePaths.DatabasePath(syncRoot);
 
         SqliteMetadataStore store;
@@ -86,75 +174,65 @@ public sealed class SyncWorker(
         // Which remote this folder's state belongs to (the app checks it before
         // pointing the folder at another remote).
         store.SetConfig("OpenCfDriveRoot", syncRoot);
-        store.SetConfig("RcloneFs", remote);
-        store.SetConfig("RcloneRcUrl", rcUrl);
-        _store = store;
+        store.SetConfig("RcloneFs", drive.Remote);
+        store.SetConfig("RcloneRcUrl", settings.RcUrl.Value);
+        drive.Store = store;
 
-        _control = new ServiceControlServer(
+        drive.Control = new ServiceControlServer(
             ServiceControl.PipeName(syncRoot),
-            BuildStatus,
+            () => BuildStatus(drive),
             lifetime.StopApplication,
             message => logger.LogInformation("{Message}", message),
-            syncNow: () => _engine?.SyncNowAsync() ?? Task.CompletedTask,
-            pulse: BuildPulse);
-        _control.Start();
+            syncNow: () => drive.Engine?.SyncNowAsync() ?? Task.CompletedTask,
+            pulse: () => BuildPulse(drive));
+        drive.Control.Start();
+    }
 
-        var endpoint = await ConnectRcloneAsync(settings, stoppingToken).ConfigureAwait(false);
-        if (endpoint is null)
-        {
-            // Nothing to sync with; stay up so the app can say why.
-            await WaitUntilStoppedAsync(stoppingToken).ConfigureAwait(false);
-            return;
-        }
-
-        _engine = new CloudSyncEngine(syncRoot, remote, endpoint, dbPath, msg => logger.LogInformation("{Message}", msg));
+    /// <summary>Connects one drive: its engine, registered with Explorer and watching.</summary>
+    private async Task StartEngineAsync(RootDrive drive, RcloneEndpoint endpoint, CancellationToken stoppingToken)
+    {
+        var syncRoot = drive.SyncRoot;
+        var dbPath = SyncStatePaths.DatabasePath(syncRoot);
+        var engine = new CloudSyncEngine(syncRoot, drive.Remote, endpoint, dbPath, msg => logger.LogInformation("{Message}", msg));
+        drive.Engine = engine;
 
         // Every failed sync step, for the app to tell the user about.
-        _engine.ProblemReported += message =>
+        engine.ProblemReported += message =>
         {
             logger.LogWarning("{Message}", message);
-            _problems.Report(message);
-            Changed();
+            drive.Problems.Report(message);
+            drive.Changed();
         };
 
         // Sending, downloading, offline: the app's icon shows it as it happens.
-        _engine.ActivityChanged += Changed;
+        engine.ActivityChanged += drive.Changed;
 
-        try
+        var status = await engine.InitializeAsync(stoppingToken).ConfigureAwait(false);
+        drive.Initialized = status;
+
+        logger.LogInformation(
+            "Drive '{SyncRoot}': mode: {Mode} | cloudFiles={Supported} ({Reason}) | registered={Registered} | connected={Connected} | items={Items}",
+            syncRoot,
+            status.CloudFilesSupported ? "cloud" : "unavailable",
+            status.CloudFilesSupported,
+            status.CapabilityReason,
+            status.Registered,
+            status.Connected,
+            status.RegisteredItems);
+
+        if (status.CloudFilesSupported)
         {
-            var status = await _engine.InitializeAsync(stoppingToken).ConfigureAwait(false);
-            _initialized = status;
-
-            logger.LogInformation(
-                "Mode: {Mode} | cloudFiles={Supported} ({Reason}) | registered={Registered} | connected={Connected} | items={Items}",
-                status.CloudFilesSupported ? "cloud" : "unavailable",
-                status.CloudFilesSupported,
-                status.CapabilityReason,
-                status.Registered,
-                status.Connected,
-                status.RegisteredItems);
-
-            if (status.CloudFilesSupported)
-            {
-                _engine.StartWatcher();
-                _engine.StartBackgroundSync();
-                SetState(status.Registered && status.Connected
-                    ? (ServiceState.Syncing, "The drive is registered with Explorer and connected.")
-                    : (ServiceState.Failed, "The drive could not be registered or connected; see the log."));
-            }
-            else
-            {
-                logger.LogError("Cloud Files is not available ({Reason}); nothing is synced.", status.CapabilityReason);
-                SetState((ServiceState.Unavailable, status.CapabilityReason));
-            }
+            engine.StartWatcher();
+            engine.StartBackgroundSync();
+            drive.State = status.Registered && status.Connected
+                ? (ServiceState.Syncing, "The drive is registered with Explorer and connected.")
+                : (ServiceState.Failed, "The drive could not be registered or connected; see the log.");
         }
-        catch (Exception ex) when (ex is not OperationCanceledException)
+        else
         {
-            logger.LogError(ex, "Sync engine initialisation failed");
-            SetState((ServiceState.Failed, ex.Message));
+            logger.LogError("Cloud Files is not available ({Reason}); '{SyncRoot}' is not synced.", status.CapabilityReason, syncRoot);
+            drive.State = (ServiceState.Unavailable, status.CapabilityReason);
         }
-
-        await WaitUntilStoppedAsync(stoppingToken).ConfigureAwait(false);
     }
 
     private static async Task WaitUntilStoppedAsync(CancellationToken stoppingToken)
@@ -190,13 +268,12 @@ public sealed class SyncWorker(
                 : $"rclone was not found at '{settings.RclonePath}'.";
             logger.LogError("{Why}", why);
             _rcloneStatus = new RcloneStatus(true, "", settings.RclonePath, null, null, null, "NotFound", why, null);
-            SetState((ServiceState.Failed, why));
+            FailEveryDrive(why);
             return null;
         }
 
         _rcloneStatus = new RcloneStatus(
             true, "", program.Path, program.Source.ToString(), null, null, "Starting", "Starting rclone.", RcloneLogPath);
-        SetState((_state, "Starting rclone."));
         try
         {
             _daemon = await RcloneDaemon.StartAsync(
@@ -205,7 +282,6 @@ public sealed class SyncWorker(
                 RcloneLogPath,
                 message => logger.LogInformation("{Message}", message),
                 stoppingToken).ConfigureAwait(false);
-            SetState((_state, "Registering and connecting the drive."));
             return _daemon.Endpoint;
         }
         catch (Exception ex) when (ex is InvalidOperationException or System.ComponentModel.Win32Exception)
@@ -213,8 +289,21 @@ public sealed class SyncWorker(
             var why = $"rclone could not be started: {ex.Message}";
             logger.LogError("{Why}", why);
             _rcloneStatus = _rcloneStatus with { State = "Failed", Detail = why };
-            SetState((ServiceState.Failed, why));
+            FailEveryDrive(why);
             return null;
+        }
+    }
+
+    /// <summary>Nothing can sync without rclone: every drive says so.</summary>
+    private void FailEveryDrive(string why)
+    {
+        foreach (var drive in _drives)
+        {
+            if (drive.State.State != ServiceState.Failed)
+            {
+                drive.State = (ServiceState.Failed, why);
+                drive.Changed();
+            }
         }
     }
 
@@ -232,70 +321,48 @@ public sealed class SyncWorker(
                 daemon.LogPath)
             : _rcloneStatus;
 
-    private void SetState((ServiceState State, string Detail) state)
-    {
-        (_state, _detail) = state;
-        Changed();
-    }
-
-    /// <summary>Something a pulse shows has changed: it is numbered, and sent to a watching app.</summary>
-    private void Changed()
-    {
-        Interlocked.Increment(ref _revision);
-        _control?.NotifyChanged();
-    }
-
-    /// <summary>The state to report: a connected drive whose server cannot be reached is offline.</summary>
-    private (ServiceState State, string Detail) StateNow() =>
-        _state == ServiceState.Syncing && _engine is { IsOnline: false } engine
-            ? (ServiceState.Offline,
-               $"The server cannot be reached ({engine.OfflineReason}). Folders show what is on this PC, and changes " +
-               "are sent once it answers; it is checked again when the network changes, when the drive is used, and every minute or so.")
-            : (_state, _detail);
-
-    private ServicePulse BuildPulse()
+    private ServicePulse BuildPulse(RootDrive drive)
     {
         // The number first: what is read after it is at least that new.
-        var revision = Interlocked.Read(ref _revision);
-        var (state, detail) = StateNow();
-        return new ServicePulse(Environment.ProcessId, revision, state, detail, _engine?.Activity ?? SyncActivity.None, _problems.Count);
+        var revision = Interlocked.Read(ref drive.Revision);
+        var (state, detail) = drive.StateNow();
+        return new ServicePulse(Environment.ProcessId, revision, state, detail, drive.Engine?.Activity ?? SyncActivity.None, drive.Problems.Count);
     }
 
-    private ServiceStatus BuildStatus()
+    private ServiceStatus BuildStatus(RootDrive drive)
     {
-        var revision = Interlocked.Read(ref _revision);
-        var settings = _settings!;
+        var revision = Interlocked.Read(ref drive.Revision);
         var items = 0;
         try
         {
-            items = _store?.Count() ?? 0;
+            items = drive.Store.Count();
         }
         catch (Microsoft.Data.Sqlite.SqliteException)
         {
             // Busy for a moment; the next request counts again.
         }
 
-        var initialized = _initialized;
-        var (state, detail) = StateNow();
+        var initialized = drive.Initialized;
+        var (state, detail) = drive.StateNow();
         return new ServiceStatus(
             Environment.ProcessId,
             _startedAt,
             Version,
-            settings.SyncRoot.Value,
-            settings.Remote.Value,
-            settings.RcUrl.Value,
+            drive.SyncRoot,
+            drive.Remote,
+            _settings?.RcUrl.Value ?? "",
             state,
             detail,
             initialized?.Registered ?? false,
             initialized?.Connected ?? false,
             items,
-            _engine?.BytesFetched ?? 0,
+            drive.Engine?.BytesFetched ?? 0,
             ConsoleOutput.ActiveLogPath ?? "",
             activity.Recent(100),
             RcloneNow(),
-            _problems.Count,
-            _problems.Recent(),
-            _engine?.Activity ?? SyncActivity.None,
+            drive.Problems.Count,
+            drive.Problems.Recent(),
+            drive.Engine?.Activity ?? SyncActivity.None,
             revision);
     }
 
@@ -305,17 +372,23 @@ public sealed class SyncWorker(
 
     public override async Task StopAsync(CancellationToken cancellationToken)
     {
-        if (_control is not null)
+        foreach (var drive in _drives)
         {
-            await _control.DisposeAsync().ConfigureAwait(false);
+            if (drive.Control is not null)
+            {
+                await drive.Control.DisposeAsync().ConfigureAwait(false);
+            }
         }
 
-        if (_engine is not null)
+        foreach (var drive in _drives)
         {
-            await _engine.DisposeAsync().ConfigureAwait(false);
+            if (drive.Engine is not null)
+            {
+                await drive.Engine.DisposeAsync().ConfigureAwait(false);
+            }
         }
 
-        // After the engine: it may still be finishing a request through it.
+        // After the engines: they may still be finishing a request through it.
         if (_daemon is not null)
         {
             await _daemon.DisposeAsync().ConfigureAwait(false);

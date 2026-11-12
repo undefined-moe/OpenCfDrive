@@ -7,7 +7,7 @@ using OpenCfDrive.Service;
 
 ConsoleOutput.Connect();
 
-var syncRoot = DriveSettingsFile.Current().SyncRoot.Value;
+var roots = DriveSettingsFile.Current().Roots;
 
 // --stop: ends the other running copies of this same exe (the installer runs
 // it before replacing or removing the files). Copies elsewhere are left alone.
@@ -24,31 +24,49 @@ if (args.Contains("--stop", StringComparer.OrdinalIgnoreCase))
 if (args.Contains("--unregister", StringComparer.OrdinalIgnoreCase))
 {
     var registrar = new SyncRootRegistrar();
-    var result = registrar.Unregister(syncRoot);
-    Console.WriteLine(result.Message);
-    return result.Success ? 0 : 1;
+    var code = 0;
+    foreach (var root in roots)
+    {
+        var result = registrar.Unregister(root.SyncRoot);
+        Console.WriteLine(result.Message);
+        code |= result.Success ? 0 : 1;
+    }
+
+    return code;
 }
 
 // One provider per drive: a second start (the Start Menu shortcut clicked
 // twice) would connect to the same sync root and upload everything twice.
 // Owned, not just created: the app opens the mutex for a moment to see whether
 // the drive's service runs, so its existence alone proves nothing. The wait
-// covers such a moment.
-using var instance = new Mutex(initiallyOwned: false, ServiceControl.InstanceMutexName(syncRoot));
-bool firstInstance;
-try
+// covers such a moment. One mutex per drive, so the app can ask about each.
+var instances = new List<Mutex>();
+foreach (var root in roots)
 {
-    firstInstance = instance.WaitOne(TimeSpan.FromSeconds(2));
-}
-catch (AbandonedMutexException)
-{
-    firstInstance = true; // the previous copy ended without releasing it
-}
+    var instance = new Mutex(initiallyOwned: false, ServiceControl.InstanceMutexName(root.SyncRoot));
+    bool firstInstance;
+    try
+    {
+        firstInstance = instance.WaitOne(TimeSpan.FromSeconds(2));
+    }
+    catch (AbandonedMutexException)
+    {
+        firstInstance = true; // the previous copy ended without releasing it
+    }
 
-if (!firstInstance)
-{
-    Console.WriteLine($"OpenCfDrive is already running for '{syncRoot}'.");
-    return 0;
+    if (!firstInstance)
+    {
+        Console.WriteLine($"OpenCfDrive is already running for '{root.SyncRoot}'.");
+        foreach (var held in instances)
+        {
+            held.ReleaseMutex();
+            held.Dispose();
+        }
+
+        return 0;
+    }
+
+    instances.Add(instance);
 }
 
 var builder = Host.CreateApplicationBuilder(args);

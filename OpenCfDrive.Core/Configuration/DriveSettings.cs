@@ -3,6 +3,11 @@ using OpenCfDrive.Core.Storage;
 
 namespace OpenCfDrive.Core.Configuration;
 
+/// <summary>One drive: the folder it lives in and the remote it syncs with.</summary>
+/// <param name="SyncRoot">The drive folder.</param>
+/// <param name="Remote">The rclone remote spec, e.g. "myremote:" or "myremote:backup".</param>
+public sealed record DriveRoot(string SyncRoot, string? Remote);
+
 /// <summary>
 /// What the user chose in the OpenCfDrive app, kept in
 /// %LOCALAPPDATA%\OpenCfDrive\settings.json. A null value was never set and
@@ -16,6 +21,12 @@ public sealed record DriveSettings
 
     /// <summary>The rclone remote spec, e.g. "myremote:" or "myremote:backup".</summary>
     public string? Remote { get; init; }
+
+    /// <summary>
+    /// Every drive when there is more than one; null and an empty list mean
+    /// the one <see cref="SyncRoot"/> and <see cref="Remote"/> above describe.
+    /// </summary>
+    public IReadOnlyList<DriveRoot>? Roots { get; init; }
 
     /// <summary>
     /// Whether OpenCfDrive runs rclone's remote control itself (the default),
@@ -55,12 +66,16 @@ public enum SettingSource
 /// <summary>A setting's value in effect, and where it came from.</summary>
 public sealed record EffectiveSetting(string Value, SettingSource Source, string EnvironmentVariable);
 
+/// <summary>One drive the service runs with, in effect.</summary>
+public sealed record EffectiveRoot(string SyncRoot, string Remote);
+
 /// <summary>The settings the service runs with.</summary>
 /// <param name="ManageRclone">OpenCfDrive runs rclone itself; otherwise it uses the one at <paramref name="RcUrl"/>.</param>
 /// <param name="RclonePath">The rclone program chosen (environment or settings), or null to find one.</param>
 /// <param name="RcloneConfig">The rclone config file chosen, or null for rclone's default.</param>
 /// <param name="RcUser">The login for the remote control at <paramref name="RcUrl"/>, or null for none.</param>
 /// <param name="RcPassword">Its password, in plain text: never logged or shown.</param>
+/// <param name="MoreRoots">The drives after the first, when the user configured several; they always come from the settings file.</param>
 public sealed record EffectiveSettings(
     EffectiveSetting SyncRoot,
     EffectiveSetting Remote,
@@ -69,8 +84,13 @@ public sealed record EffectiveSettings(
     string? RclonePath = null,
     string? RcloneConfig = null,
     string? RcUser = null,
-    string? RcPassword = null)
+    string? RcPassword = null,
+    IReadOnlyList<EffectiveRoot>? MoreRoots = null)
 {
+    /// <summary>Every drive in effect, first the one <see cref="SyncRoot"/> and <see cref="Remote"/> describe.</summary>
+    public IReadOnlyList<EffectiveRoot> Roots =>
+        MoreRoots is { Count: > 0 } more ? [new(SyncRoot.Value, Remote.Value), .. more] : [new(SyncRoot.Value, Remote.Value)];
+
     /// <summary>A remote was chosen; without one the service has nothing to sync.</summary>
     public bool HasRemote => Remote.Source != SettingSource.Default;
 
@@ -80,7 +100,7 @@ public sealed record EffectiveSettings(
     /// <summary>Never the password.</summary>
     public override string ToString() =>
         $"{nameof(EffectiveSettings)} {{ SyncRoot = {SyncRoot}, Remote = {Remote}, RcUrl = {RcUrl}, ManageRclone = {ManageRclone}, " +
-        $"RclonePath = {RclonePath}, RcloneConfig = {RcloneConfig}, RcUser = {RcUser} }}";
+        $"RclonePath = {RclonePath}, RcloneConfig = {RcloneConfig}, RcUser = {RcUser}, Roots = {Roots.Count} }}";
 }
 
 public static class DriveSettingsFile
@@ -175,7 +195,7 @@ public static class DriveSettingsFile
                 : new EffectiveSetting(fromFile.Trim(), SettingSource.SettingsFile, variable);
         }
 
-        var remote = Pick(RemoteVariable, saved.Remote, DefaultRemote);
+        var remote = Pick(RemoteVariable, FirstOf(saved.Roots)?.Remote ?? saved.Remote, DefaultRemote);
         var rcUrl = Pick(RcUrlVariable, saved.RcUrl, DefaultRcUrl);
         var rclonePath = environment(RclonePathVariable);
 
@@ -184,8 +204,18 @@ public static class DriveSettingsFile
         var (rcUser, rcPassword) = Blank(environment(RcUserVariable)) is { } envUser
             ? (envUser, environment(RcPasswordVariable))
             : (Blank(saved.RcUser), UserSecret.Unprotect(saved.RcPasswordProtected));
+
+        // The drives after the first come from the file only: the environment
+        // names one drive (the first), and a root without a folder or a
+        // remote cannot sync, so it is left out rather than guessed at.
+        var moreRoots = saved.Roots is { Count: > 1 } roots
+            ? roots.Skip(1)
+                .Where(root => !string.IsNullOrWhiteSpace(root.SyncRoot) && !string.IsNullOrWhiteSpace(root.Remote))
+                .Select(root => new EffectiveRoot(root.SyncRoot.Trim(), SyncStatePaths.NormalizeRemote(root.Remote)))
+                .ToArray()
+            : null;
         return new EffectiveSettings(
-            Pick(SyncRootVariable, saved.SyncRoot, SyncStatePaths.DefaultSyncRoot),
+            Pick(SyncRootVariable, FirstOf(saved.Roots)?.SyncRoot ?? saved.SyncRoot, SyncStatePaths.DefaultSyncRoot),
             remote with { Value = SyncStatePaths.NormalizeRemote(remote.Value) },
             rcUrl,
             // A remote control address in the environment (scripts, tests)
@@ -194,10 +224,14 @@ public static class DriveSettingsFile
             RclonePath: string.IsNullOrWhiteSpace(rclonePath) ? Blank(saved.RclonePath) : rclonePath.Trim(),
             RcloneConfig: Blank(saved.RcloneConfig),
             RcUser: rcUser,
-            RcPassword: rcUser is null ? null : rcPassword);
+            RcPassword: rcUser is null ? null : rcPassword,
+            MoreRoots: moreRoots);
     }
 
     private static string? Blank(string? value) => string.IsNullOrWhiteSpace(value) ? null : value.Trim();
+
+    private static DriveRoot? FirstOf(IReadOnlyList<DriveRoot>? roots) =>
+        roots is { Count: > 0 } ? roots[0] : null;
 
     /// <summary>The settings the service runs with right now (a broken file counts as empty).</summary>
     public static EffectiveSettings Current()

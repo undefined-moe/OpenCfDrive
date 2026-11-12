@@ -4,7 +4,7 @@ using OpenCfDrive.Core.Control;
 
 namespace OpenCfDrive.App;
 
-/// <summary>Starts and stops the sync service (OpenCfDrive.Service.exe) for the configured drive.</summary>
+/// <summary>Starts and stops the sync service (OpenCfDrive.Service.exe) for the configured drives.</summary>
 internal static class SyncService
 {
     private const string ExeName = "OpenCfDrive.Service.exe";
@@ -42,10 +42,13 @@ internal static class SyncService
         }
     }
 
-    /// <summary>Starts the service and waits until it runs; returns why not otherwise.</summary>
-    public static async Task<string?> StartAsync(string syncRoot)
+    /// <summary>
+    /// Starts the service (one process for every drive) and waits until it
+    /// runs; returns why not otherwise.
+    /// </summary>
+    public static async Task<string?> StartAsync(IReadOnlyList<string> syncRoots)
     {
-        if (ServiceControl.IsRunning(syncRoot))
+        if (syncRoots.Any(ServiceControl.IsRunning))
         {
             return null;
         }
@@ -76,7 +79,7 @@ internal static class SyncService
             var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(15);
             while (DateTime.UtcNow < deadline)
             {
-                if (ServiceControl.IsRunning(syncRoot))
+                if (syncRoots.Any(ServiceControl.IsRunning))
                 {
                     return null;
                 }
@@ -93,18 +96,22 @@ internal static class SyncService
         return "The service did not start within 15 seconds; its log says why.";
     }
 
-    /// <summary>Asks the service to stop, and ends it if it does not; returns why it still runs otherwise.</summary>
-    public static async Task<string?> StopAsync(string syncRoot)
+    /// <summary>
+    /// Asks the service to stop (one process, so every drive stops together),
+    /// and ends it if it does not; returns why it still runs otherwise.
+    /// </summary>
+    public static async Task<string?> StopAsync(IReadOnlyList<string> syncRoots)
     {
-        if (!ServiceControl.IsRunning(syncRoot))
+        var running = syncRoots.Where(ServiceControl.IsRunning).ToList();
+        if (running.Count == 0)
         {
             return null;
         }
 
-        var status = await ServiceControl.GetStatusAsync(syncRoot, TimeSpan.FromSeconds(2));
+        var status = await ServiceControl.GetStatusAsync(running[0], TimeSpan.FromSeconds(2));
         using var process = status is null ? null : ProcessById(status.ProcessId);
-        await ServiceControl.RequestStopAsync(syncRoot, TimeSpan.FromSeconds(2));
-        if (await WaitUntilStoppedAsync(syncRoot, process, TimeSpan.FromSeconds(15)))
+        await ServiceControl.RequestStopAsync(running[0], TimeSpan.FromSeconds(2));
+        if (await WaitUntilStoppedAsync(syncRoots, process, TimeSpan.FromSeconds(15)))
         {
             return null;
         }
@@ -119,7 +126,7 @@ internal static class SyncService
             // Already gone.
         }
 
-        return await WaitUntilStoppedAsync(syncRoot, process, TimeSpan.FromSeconds(10))
+        return await WaitUntilStoppedAsync(syncRoots, process, TimeSpan.FromSeconds(10))
             ? null
             : "The service did not stop.";
     }
@@ -137,16 +144,16 @@ internal static class SyncService
     }
 
     /// <summary>
-    /// Until the drive's service no longer runs and, when known, its process
-    /// has ended: it gives up its instance mutex a moment before it exits and
-    /// closes its state database, which saving may delete next.
+    /// Until no drive's service runs and, when known, its process has ended:
+    /// it gives up its instance mutexes a moment before it exits and closes
+    /// its state databases, which saving may delete next.
     /// </summary>
-    private static async Task<bool> WaitUntilStoppedAsync(string syncRoot, Process? process, TimeSpan timeout)
+    private static async Task<bool> WaitUntilStoppedAsync(IReadOnlyList<string> syncRoots, Process? process, TimeSpan timeout)
     {
         var deadline = DateTime.UtcNow + timeout;
         while (DateTime.UtcNow < deadline)
         {
-            if (!ServiceControl.IsRunning(syncRoot) && (process is null || process.HasExited))
+            if (!syncRoots.Any(ServiceControl.IsRunning) && (process is null || process.HasExited))
             {
                 return true;
             }

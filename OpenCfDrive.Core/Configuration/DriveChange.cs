@@ -29,7 +29,7 @@ public sealed record DriveChange(
     /// <param name="stateOf">A folder's state database, or null if it has none.</param>
     public static DriveChange Check(
         string currentSyncRoot,
-        string currentRemote,
+        string? currentRemote,
         string newSyncRoot,
         string newRemote,
         Func<string, bool> isSyncRoot,
@@ -39,7 +39,8 @@ public sealed record DriveChange(
         var root = Normalize(newSyncRoot);
         var remote = SyncStatePaths.NormalizeRemote(newRemote);
         var sameRoot = string.Equals(oldRoot, root, StringComparison.OrdinalIgnoreCase);
-        var sameRemote = string.Equals(SyncStatePaths.NormalizeRemote(currentRemote), remote, StringComparison.Ordinal);
+        var sameRemote = currentRemote is not null &&
+                         string.Equals(SyncStatePaths.NormalizeRemote(currentRemote), remote, StringComparison.Ordinal);
 
         if (sameRoot && sameRemote)
         {
@@ -59,7 +60,7 @@ public sealed record DriveChange(
 
         if (!empty && !(formerDriveOfThisRemote && !sameRoot))
         {
-            var problem = sameRoot
+            var problem = sameRoot && currentRemote is not null
                 ? $"To use another remote, choose a new, empty drive folder. '{root}' is already the drive " +
                   $"for {SyncStatePaths.NormalizeRemote(currentRemote)}."
                 : $"'{root}' is not empty. Choose a new or empty folder for the drive.";
@@ -97,7 +98,7 @@ public sealed record DriveChange(
     }
 
     /// <summary>For the app: the real checks against this machine.</summary>
-    public static DriveChange Check(string currentSyncRoot, string currentRemote, string newSyncRoot, string newRemote) =>
+    public static DriveChange Check(string currentSyncRoot, string? currentRemote, string newSyncRoot, string newRemote) =>
         Check(currentSyncRoot, currentRemote, newSyncRoot, newRemote, SyncRootRegistrar.IsSyncRoot, StateOf);
 
     private static string Normalize(string folder) =>
