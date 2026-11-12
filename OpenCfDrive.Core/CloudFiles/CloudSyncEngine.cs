@@ -953,6 +953,10 @@ public sealed class CloudSyncEngine : IAsyncDisposable, ILocalSide
     /// placeholder has nothing to free), not pinned by its own attribute, and
     /// neither opened nor written within the age limit. A file downloaded but
     /// never opened keeps the placeholder's old times, so it counts as unused.
+    /// The access time is meaningful even where NTFS's own last-access updates
+    /// are off (they are on by default since Windows 10 2004): the cloud files
+    /// filter driver refreshes it on reads, which is what OneDrive's own
+    /// "online-only if not opened for N days" goes by too.
     /// </summary>
     internal static bool ShouldFreeUnused(
         FileAttributes attributes, DateTime lastAccessUtc, DateTime lastWriteUtc, DateTime nowUtc, TimeSpan unusedAfter) =>
