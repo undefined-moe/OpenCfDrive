@@ -95,20 +95,43 @@ internal sealed record DriveSnapshot(
             return (Health.Busy, "Starting", "The drive is registering and connecting.");
         }
 
-        var ownRclone = root.Status.Rclone is { Managed: true } own ? own : null;
-        return root.Status.State switch
+        var status = root.Status;
+        var ownRclone = status.Rclone is { Managed: true } own ? own : null;
+        if (status.State == ServiceState.Starting)
         {
-            ServiceState.Starting => (Health.Busy, "Starting", root.Status.Detail),
-            ServiceState.Offline => (Health.Busy, "Offline", $"{root.Status.Detail} {root.Status.Activity?.Describe()}".TrimEnd()),
-            ServiceState.Unavailable => (Health.Problem, "Cloud Files unavailable", root.Status.Detail),
-            ServiceState.Failed when ownRclone?.State == "NotFound" => (Health.Problem, "rclone not found", root.Status.Detail),
-            ServiceState.Failed => (Health.Problem, "Problem", root.Status.Detail),
-            _ when root.Status.Activity is not { } activity => (Health.Good, "Running", root.Status.Detail),
-            _ when activity.Busy => (Health.Good, "Syncing", activity.Describe()),
-            _ => activity.Failing > 0
-                ? (Health.Busy, activity.Failing == 1 ? "1 file not synced" : $"{activity.Failing:N0} files not synced", activity.Describe())
-                : (Health.Good, "Up to date", root.Status.Detail),
-        };
+            return (Health.Busy, "Starting", status.Detail);
+        }
+
+        if (status.State == ServiceState.Offline)
+        {
+            return (Health.Busy, "Offline", $"{status.Detail} {status.Activity?.Describe()}".TrimEnd());
+        }
+
+        if (status.State == ServiceState.Unavailable)
+        {
+            return (Health.Problem, "Cloud Files unavailable", status.Detail);
+        }
+
+        if (status.State == ServiceState.Failed)
+        {
+            return ownRclone?.State == "NotFound"
+                ? (Health.Problem, "rclone not found", status.Detail)
+                : (Health.Problem, "Problem", status.Detail);
+        }
+
+        if (status.Activity is not { } activity)
+        {
+            return (Health.Good, "Running", status.Detail); // a service from before activity was reported
+        }
+
+        if (activity.Busy)
+        {
+            return (Health.Good, "Syncing", activity.Describe());
+        }
+
+        return activity.Failing > 0
+            ? (Health.Busy, activity.Failing == 1 ? "1 file not synced" : $"{activity.Failing:N0} files not synced", activity.Describe())
+            : (Health.Good, "Up to date", status.Detail);
     }
 
     private static int Rank(Health health) => health switch
