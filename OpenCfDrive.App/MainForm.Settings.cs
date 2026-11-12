@@ -549,7 +549,7 @@ internal sealed partial class MainForm
             }
             else
             {
-                _draftRoots = [(saved.SyncRoot ?? snapshot.Settings.SyncRoot.Value, saved.Remote ?? "", saved.Roots is { Count: > 0 } first ? first[0].TtlDays?.ToString() ?? "" : "")];
+                _draftRoots = [(saved.SyncRoot ?? snapshot.Settings.SyncRoot.Value, saved.Remote ?? "", "")];
             }
 
             _rootIndex = 0;
