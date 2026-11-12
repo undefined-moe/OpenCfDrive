@@ -6,7 +6,8 @@ namespace OpenCfDrive.Core.Configuration;
 /// <summary>One drive: the folder it lives in and the remote it syncs with.</summary>
 /// <param name="SyncRoot">The drive folder.</param>
 /// <param name="Remote">The rclone remote spec, e.g. "myremote:" or "myremote:backup".</param>
-public sealed record DriveRoot(string SyncRoot, string? Remote);
+/// <param name="TtlDays">How many days a downloaded file may go unopened before its local copy is freed (like "Free up space"); null or 0 never frees.</param>
+public sealed record DriveRoot(string SyncRoot, string? Remote, int? TtlDays = null);
 
 /// <summary>
 /// What the user chose in the OpenCfDrive app, kept in
@@ -67,7 +68,8 @@ public enum SettingSource
 public sealed record EffectiveSetting(string Value, SettingSource Source, string EnvironmentVariable);
 
 /// <summary>One drive the service runs with, in effect.</summary>
-public sealed record EffectiveRoot(string SyncRoot, string Remote);
+/// <param name="FreeUnusedAfter">How long a downloaded file may go unopened before its local copy is freed; null never frees.</param>
+public sealed record EffectiveRoot(string SyncRoot, string Remote, TimeSpan? FreeUnusedAfter = null);
 
 /// <summary>The settings the service runs with.</summary>
 /// <param name="ManageRclone">OpenCfDrive runs rclone itself; otherwise it uses the one at <paramref name="RcUrl"/>.</param>
@@ -76,6 +78,7 @@ public sealed record EffectiveRoot(string SyncRoot, string Remote);
 /// <param name="RcUser">The login for the remote control at <paramref name="RcUrl"/>, or null for none.</param>
 /// <param name="RcPassword">Its password, in plain text: never logged or shown.</param>
 /// <param name="MoreRoots">The drives after the first, when the user configured several; they always come from the settings file.</param>
+/// <param name="FreeUnusedAfter">How long the first drive's downloaded files may go unopened before their local copies are freed; null never frees.</param>
 public sealed record EffectiveSettings(
     EffectiveSetting SyncRoot,
     EffectiveSetting Remote,
@@ -85,11 +88,14 @@ public sealed record EffectiveSettings(
     string? RcloneConfig = null,
     string? RcUser = null,
     string? RcPassword = null,
-    IReadOnlyList<EffectiveRoot>? MoreRoots = null)
+    IReadOnlyList<EffectiveRoot>? MoreRoots = null,
+    TimeSpan? FreeUnusedAfter = null)
 {
     /// <summary>Every drive in effect, first the one <see cref="SyncRoot"/> and <see cref="Remote"/> describe.</summary>
     public IReadOnlyList<EffectiveRoot> Roots =>
-        MoreRoots is { Count: > 0 } more ? [new(SyncRoot.Value, Remote.Value), .. more] : [new(SyncRoot.Value, Remote.Value)];
+        MoreRoots is { Count: > 0 } more
+            ? [new(SyncRoot.Value, Remote.Value, FreeUnusedAfter), .. more]
+            : [new(SyncRoot.Value, Remote.Value, FreeUnusedAfter)];
 
     /// <summary>A remote was chosen; without one the service has nothing to sync.</summary>
     public bool HasRemote => Remote.Source != SettingSource.Default;
@@ -211,7 +217,7 @@ public static class DriveSettingsFile
         var moreRoots = saved.Roots is { Count: > 1 } roots
             ? roots.Skip(1)
                 .Where(root => !string.IsNullOrWhiteSpace(root.SyncRoot) && !string.IsNullOrWhiteSpace(root.Remote))
-                .Select(root => new EffectiveRoot(root.SyncRoot.Trim(), SyncStatePaths.NormalizeRemote(root.Remote)))
+                .Select(root => new EffectiveRoot(root.SyncRoot.Trim(), SyncStatePaths.NormalizeRemote(root.Remote), TtlOf(root)))
                 .ToArray()
             : null;
         return new EffectiveSettings(
@@ -225,13 +231,18 @@ public static class DriveSettingsFile
             RcloneConfig: Blank(saved.RcloneConfig),
             RcUser: rcUser,
             RcPassword: rcUser is null ? null : rcPassword,
-            MoreRoots: moreRoots);
+            MoreRoots: moreRoots,
+            FreeUnusedAfter: TtlOf(FirstOf(saved.Roots)));
     }
 
     private static string? Blank(string? value) => string.IsNullOrWhiteSpace(value) ? null : value.Trim();
 
     private static DriveRoot? FirstOf(IReadOnlyList<DriveRoot>? roots) =>
         roots is { Count: > 0 } ? roots[0] : null;
+
+    /// <summary>A drive's "free unused files" age from its TtlDays; 0 and null mean never.</summary>
+    private static TimeSpan? TtlOf(DriveRoot? root) =>
+        root?.TtlDays is int days and > 0 ? TimeSpan.FromDays(days) : null;
 
     /// <summary>The settings the service runs with right now (a broken file counts as empty).</summary>
     public static EffectiveSettings Current()

@@ -167,6 +167,20 @@ public class SqliteMetadataStoreTests
     }
 
     [Fact]
+    public void ListHydratedFiles_ReturnsFilesWithALocalCopy_Only()
+    {
+        var store = new SqliteMetadataStore(TempDbPath());
+        store.Initialize();
+        store.UpsertFile("docs/", @"C:\drive\docs", "docs/", 0, true, true, 0, null);
+        store.UpsertFile("docs/kept.txt", @"C:\drive\docs\kept.txt", "docs/kept.txt", 0, true, false, 1, null);
+        store.UpsertFile("docs/online.txt", @"C:\drive\docs\online.txt", "docs/online.txt", 0, true, false, 1, null);
+        store.MarkHydrated("docs/kept.txt");
+
+        var file = Assert.Single(store.ListHydratedFiles());
+        Assert.Equal("docs/kept.txt", file.RemotePath);
+    }
+
+    [Fact]
     public void Upsert_AndLookups_RoundTrip()
     {
         var store = new SqliteMetadataStore(TempDbPath());

@@ -187,6 +187,34 @@ public sealed class DriveSettingsTests : IDisposable
         Assert.Single(effective.Roots);
     }
 
+    [Fact]
+    public void Resolve_TurnsTtlDays_IntoAFreeAge_PerDrive()
+    {
+        var saved = new DriveSettings
+        {
+            Roots = [new DriveRoot(@"D:\One", "box:", TtlDays: 30), new DriveRoot(@"D:\Two", "s3:", TtlDays: 0)],
+        };
+
+        var effective = DriveSettingsFile.Resolve(saved, _ => null);
+
+        Assert.Equal(TimeSpan.FromDays(30), effective.Roots[0].FreeUnusedAfter);
+        Assert.Null(effective.Roots[1].FreeUnusedAfter); // 0 means never
+        Assert.Null(DriveSettingsFile.Resolve(new DriveSettings(), _ => null).Roots[0].FreeUnusedAfter);
+    }
+
+    [Fact]
+    public void Roots_WithATtl_RoundTrip()
+    {
+        var saved = new DriveSettings
+        {
+            Roots = [new DriveRoot(@"D:\One", "box:", TtlDays: 14)],
+        };
+
+        DriveSettingsFile.Save(saved, SettingsPath);
+
+        Assert.Equal(saved.Roots, DriveSettingsFile.Load(SettingsPath).Roots);
+    }
+
     public void Dispose()
     {
         try

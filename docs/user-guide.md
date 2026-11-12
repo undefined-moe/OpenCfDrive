@@ -171,6 +171,7 @@ and pages scroll.
 | --- | --- |
 | Drives | Every drive: its folder and its remote. **Add drive** starts another one; each gets its own place in Explorer. |
 | rclone remote | The remote the chosen drive shows, such as `myremote:` or `myremote:backup`. |
+| Free up after | Days without opening after which a downloaded file's local copy is removed, like right-clicking **Free up space**. The file stays in the list and downloads again when opened. Empty means never. Files with changes not yet uploaded, and anything marked **Always keep on this device**, are kept. |
 | rclone | **OpenCfDrive runs it** (the default), or **I run rclone rcd myself** at the address you give. |
 | rclone program | A specific `rclone.exe`. Leave it empty to use the one on `PATH`, or else the downloaded copy. |
 | rclone config file | A specific `rclone.conf`. Leave it empty for rclone's own default (`rclone config file` tells you where that is). |

@@ -487,6 +487,22 @@ public sealed class SqliteMetadataStore
         return results;
     }
 
+    /// <summary>The files with a local copy (see FileRecord.IsHydrated): what a "free up unused" pass looks at.</summary>
+    public IReadOnlyList<FileRecord> ListHydratedFiles()
+    {
+        using var connection = Open();
+        using var command = connection.CreateCommand();
+        command.CommandText = "SELECT * FROM Files WHERE IsHydrated = 1 AND IsDirectory = 0 ORDER BY Id;";
+        using var reader = command.ExecuteReader();
+        var results = new List<FileRecord>();
+        while (reader.Read())
+        {
+            results.Add(FileRecord.FromReader(reader));
+        }
+
+        return results;
+    }
+
     public void SetConfig(string key, string value)
     {
         using var connection = Open();

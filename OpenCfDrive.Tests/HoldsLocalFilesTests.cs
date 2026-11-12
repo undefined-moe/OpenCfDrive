@@ -120,6 +120,33 @@ public class HoldsLocalFilesTests : IDisposable
         Assert.True(CloudSyncEngine.HoldsLocalFiles(_store, _root, "plain", simulated: true));
     }
 
+    // --- what the "free up unused" pass may free ----------------------------
+
+    private const FileAttributes Pinned = (FileAttributes)0x00080000;
+    private const FileAttributes RecallOnDataAccess = (FileAttributes)0x00400000;
+
+    [Fact]
+    public void ALocalFileUnopenedForTheConfiguredDays_MayBeFreed()
+    {
+        var now = DateTime.UtcNow;
+        Assert.True(CloudSyncEngine.ShouldFreeUnused(
+            FileAttributes.Archive, now.AddDays(-31), now.AddDays(-40), now, TimeSpan.FromDays(30)));
+        // The write, not the open, is the more recent use here.
+        Assert.False(CloudSyncEngine.ShouldFreeUnused(
+            FileAttributes.Archive, now.AddDays(-31), now.AddDays(-3), now, TimeSpan.FromDays(30)));
+    }
+
+    [Fact]
+    public void APlaceholderOrAPinnedFile_IsNeverFreed()
+    {
+        var now = DateTime.UtcNow;
+        var old = now.AddDays(-365);
+        Assert.False(CloudSyncEngine.ShouldFreeUnused(
+            RecallOnDataAccess | FileAttributes.Archive, old, old, now, TimeSpan.FromDays(30)));
+        Assert.False(CloudSyncEngine.ShouldFreeUnused(
+            Pinned | FileAttributes.Archive, old, old, now, TimeSpan.FromDays(30)));
+    }
+
     public void Dispose()
     {
         SqliteMetadataStore.Delete(_store.DbPath);

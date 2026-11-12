@@ -28,6 +28,9 @@ public sealed class SyncWorker(
 
         public string Remote { get; } = root.Remote;
 
+        /// <summary>How long a downloaded file may go unopened before its local copy is freed; null never frees.</summary>
+        public TimeSpan? FreeUnusedAfter { get; } = root.FreeUnusedAfter;
+
         public SqliteMetadataStore Store = null!;
 
         public ServiceControlServer? Control;
@@ -193,7 +196,9 @@ public sealed class SyncWorker(
     {
         var syncRoot = drive.SyncRoot;
         var dbPath = SyncStatePaths.DatabasePath(syncRoot);
-        var engine = new CloudSyncEngine(syncRoot, drive.Remote, endpoint, dbPath, msg => logger.LogInformation("{Message}", msg));
+        var engine = new CloudSyncEngine(
+            syncRoot, drive.Remote, endpoint, dbPath, msg => logger.LogInformation("{Message}", msg),
+            freeUnusedAfter: drive.FreeUnusedAfter);
         drive.Engine = engine;
 
         // Every failed sync step, for the app to tell the user about.

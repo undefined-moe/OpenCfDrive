@@ -106,6 +106,11 @@ public sealed class CloudSyncEngine : IAsyncDisposable, ILocalSide
     /// <summary>The sync runs; see <see cref="SyncScheduler"/>.</summary>
     private SyncScheduler? _scheduler;
 
+    /// <summary>How long a downloaded file may go unopened before its local copy is freed; null never frees.</summary>
+    private readonly TimeSpan? _freeUnusedAfter;
+
+    private ITimer? _freeUnusedTimer;
+
     /// <summary>
     /// False for remotes that have folders only as parts of file names (S3
     /// and other bucket stores): an empty folder made here cannot be on the
@@ -200,8 +205,9 @@ public sealed class CloudSyncEngine : IAsyncDisposable, ILocalSide
         string rcUrl,
         string dbPath,
         Action<string>? log = null,
-        bool forceSimulation = false)
-        : this(syncRootPath, remote, new RcloneEndpoint(rcUrl), dbPath, log, forceSimulation)
+        bool forceSimulation = false,
+        TimeSpan? freeUnusedAfter = null)
+        : this(syncRootPath, remote, new RcloneEndpoint(rcUrl), dbPath, log, forceSimulation, freeUnusedAfter)
     {
     }
 
@@ -211,7 +217,8 @@ public sealed class CloudSyncEngine : IAsyncDisposable, ILocalSide
         RcloneEndpoint rclone,
         string dbPath,
         Action<string>? log = null,
-        bool forceSimulation = false)
+        bool forceSimulation = false,
+        TimeSpan? freeUnusedAfter = null)
     {
         _syncRootPath = syncRootPath;
         _remote = remote;
@@ -219,6 +226,7 @@ public sealed class CloudSyncEngine : IAsyncDisposable, ILocalSide
         _store = new SqliteMetadataStore(dbPath);
         _log = log;
         _forceSimulation = forceSimulation;
+        _freeUnusedAfter = freeUnusedAfter;
         _changes = new LocalChanges(_store);
         _changes.Recorded += () => _scheduler?.RequestLocalRun();
         // Plain files in mock mode are outside a sync root, where the shell
@@ -869,6 +877,16 @@ public sealed class CloudSyncEngine : IAsyncDisposable, ILocalSide
         }
 
         _changes.LoadJournal();
+
+        // The "free up what has not been opened for a while" pass: a minute
+        // after start (the first sync run is under way then), then hourly.
+        if (_freeUnusedAfter is { } unusedAfter)
+        {
+            _freeUnusedTimer?.Dispose();
+            _freeUnusedTimer = TimeProvider.System.CreateTimer(
+                _ => _ = FreeUnusedAsync(unusedAfter), null, TimeSpan.FromMinutes(1), TimeSpan.FromHours(1));
+        }
+
         _ = Task.Run(() =>
         {
             try
@@ -885,6 +903,81 @@ public sealed class CloudSyncEngine : IAsyncDisposable, ILocalSide
 
             _scheduler.Start();
         });
+    }
+
+    /// <summary>
+    /// Frees the local copy of every downloaded file that has not been opened
+    /// (nor written) for <paramref name="unusedAfter"/>: the same "Free up
+    /// space" as the right-click menu, run on files nobody reads. Files with
+    /// changes not yet on the server are left for their upload (see
+    /// <see cref="ApplyPinStateNow"/>), as are pinned ones.
+    /// </summary>
+    private async Task FreeUnusedAsync(TimeSpan unusedAfter)
+    {
+        try
+        {
+            await Task.Yield();
+            foreach (var record in _store.ListHydratedFiles())
+            {
+                var localPath = record.LocalPath;
+                FileAttributes attributes;
+                DateTime lastAccess, lastWrite;
+                try
+                {
+                    attributes = File.GetAttributes(localPath);
+                    lastAccess = File.GetLastAccessTimeUtc(localPath);
+                    lastWrite = File.GetLastWriteTimeUtc(localPath);
+                }
+                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+                {
+                    continue; // gone, or being written over; the next pass looks again
+                }
+
+                if (!ShouldFreeUnused(attributes, lastAccess, lastWrite, DateTimeOffset.UtcNow.UtcDateTime, unusedAfter) ||
+                    InsideKeptDirectory(localPath))
+                {
+                    continue;
+                }
+
+                ApplyPinState(localPath, keepLocal: false);
+            }
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            ReportProblem($"Freeing unused local copies failed: {ex.Message}");
+        }
+    }
+
+    /// <summary>
+    /// Whether a downloaded file's local copy may be freed: still local (a
+    /// placeholder has nothing to free), not pinned by its own attribute, and
+    /// neither opened nor written within the age limit. A file downloaded but
+    /// never opened keeps the placeholder's old times, so it counts as unused.
+    /// </summary>
+    internal static bool ShouldFreeUnused(
+        FileAttributes attributes, DateTime lastAccessUtc, DateTime lastWriteUtc, DateTime nowUtc, TimeSpan unusedAfter) =>
+        (attributes & RecallOnDataAccessAttribute) == 0 &&
+        (attributes & PinnedAttribute) == 0 &&
+        nowUtc - (lastAccessUtc > lastWriteUtc ? lastAccessUtc : lastWriteUtc) >= unusedAfter;
+
+    /// <summary>Whether the file, or any folder above it up to the sync root, is pinned "Always keep on this device".</summary>
+    private bool InsideKeptDirectory(string localPath)
+    {
+        var root = Path.TrimEndingDirectorySeparator(Path.GetFullPath(_syncRootPath));
+        for (var dir = Path.GetDirectoryName(localPath); !string.IsNullOrEmpty(dir); dir = Path.GetDirectoryName(dir))
+        {
+            if (IsPinned(dir))
+            {
+                return true;
+            }
+
+            if (string.Equals(Path.TrimEndingDirectorySeparator(dir), root, StringComparison.OrdinalIgnoreCase))
+            {
+                return false;
+            }
+        }
+
+        return false;
     }
 
     /// <summary>
@@ -3099,6 +3192,9 @@ public sealed class CloudSyncEngine : IAsyncDisposable, ILocalSide
     {
         _scheduler?.Dispose();
         _scheduler = null;
+
+        _freeUnusedTimer?.Dispose();
+        _freeUnusedTimer = null;
 
         _watcher?.Dispose();
         _watcher = null;

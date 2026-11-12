@@ -18,6 +18,7 @@ internal sealed partial class MainForm
     private readonly ComboBox _remoteBox = new() { Anchor = AnchorStyles.Left | AnchorStyles.Right, DropDownStyle = ComboBoxStyle.DropDown, AccessibleName = "rclone remote", Margin = new Padding(0, 4, 8, 4) };
     private readonly Label _remoteDetails = Theme.Hint();
     private readonly TextBox _folderBox = Input("Drive folder");
+    private readonly TextBox _ttlBox = Input("free unused after days", "Never: downloaded files stay until you free them yourself");
     private readonly RadioButton _manageRclone = new() { Text = "OpenCfDrive runs rclone", AutoSize = true, Checked = true, Margin = new Padding(0, 2, 24, 6) };
     private readonly RadioButton _ownRclone = new() { Text = "I run rclone rcd myself", AutoSize = true, Margin = new Padding(0, 2, 0, 6) };
     private readonly TextBox _programBox = Input("rclone program", "On PATH, else the copy downloaded from rclone.org");
@@ -52,9 +53,10 @@ internal sealed partial class MainForm
 
     private FieldSet? _loaded;
     private bool _loading;
-    // The drives being edited, as (folder, remote) pairs; one of them is in
-    // the fields below the picker at a time.
-    private List<(string Folder, string Remote)> _draftRoots = [];
+    // The drives being edited, as (folder, remote, ttl) triples, ttl the text
+    // of the days box ("" for never); one of them is in the fields below the
+    // picker at a time.
+    private List<(string Folder, string Remote, string Ttl)> _draftRoots = [];
     private int _rootIndex;
     private bool _fillingRootBox;
 
@@ -117,6 +119,10 @@ internal sealed partial class MainForm
             "A remote in rclone's config, optionally with a path inside it: myremote: or myremote:backup. " +
             "Create remotes with rclone config."));
         drive.AddRow(Theme.FieldCaption("Folder"), _folderBox, browse);
+        drive.AddRow(Theme.FieldCaption("Free up after"), _ttlBox);
+        drive.AddIndented(Theme.Hint("Days without opening after which a downloaded file's local copy is removed, like " +
+            "right-clicking Free up space. The file itself stays in the list and downloads again when opened. " +
+            "Empty or 0 means never."));
         drive.SameWidthButtons();
         drive.AddIndented(Theme.Hint(
             "Where the drive appears in Explorer. Moving it, or choosing another remote, needs a new or empty folder; " +
@@ -206,13 +212,13 @@ internal sealed partial class MainForm
 
     private void WatchFields()
     {
-        foreach (var input in new Control[] { _folderBox, _remoteBox, _rcUrlBox, _rcUserBox, _rcPasswordBox, _programBox, _configBox })
+        foreach (var input in new Control[] { _folderBox, _ttlBox, _remoteBox, _rcUrlBox, _rcUserBox, _rcPasswordBox, _programBox, _configBox })
         {
             input.TextChanged += (_, _) => FieldsChanged();
         }
 
         // The fields describe the drive picked in the box above them.
-        foreach (var input in new Control[] { _folderBox, _remoteBox })
+        foreach (var input in new Control[] { _folderBox, _remoteBox, _ttlBox })
         {
             input.TextChanged += (_, _) => KeepRootDraft();
         }
@@ -336,6 +342,13 @@ internal sealed partial class MainForm
 
     private static string? Blank(string text) => string.IsNullOrWhiteSpace(text) ? null : text.Trim();
 
+    /// <summary>The TTL box's text for the edited drive, trimmed and normalised to a number.</summary>
+    private string TtlText() => TtlDaysOf(_ttlBox.Text) is { } days ? days.ToString() : _ttlBox.Text.Trim();
+
+    /// <summary>A TTL text as days: empty (never) reads null, and so does anything that is not a positive whole number (the Save check tells the user).</summary>
+    private static int? TtlDaysOf(string text) =>
+        int.TryParse(text.Trim(), out var days) && days > 0 ? days : null;
+
     /// <summary>Describes the remote typed in Settings, so it can be checked before saving.</summary>
     private async Task DescribeTypedRemoteAsync()
     {
@@ -390,7 +403,7 @@ internal sealed partial class MainForm
     // --- the drive list --------------------------------------------------------
 
     /// <summary>The picker's text for a drive: its folder's name and its remote.</summary>
-    private static string RootItemText((string Folder, string Remote) root)
+    private static string RootItemText((string Folder, string Remote, string Ttl) root)
     {
         var name = Path.GetFileName(Path.TrimEndingDirectorySeparator(
             string.IsNullOrWhiteSpace(root.Folder) ? "?" : root.Folder.Trim()));
@@ -422,7 +435,7 @@ internal sealed partial class MainForm
     {
         if (_rootIndex < _draftRoots.Count)
         {
-            _draftRoots[_rootIndex] = (_folderBox.Text, _remoteBox.Text);
+            _draftRoots[_rootIndex] = (_folderBox.Text, _remoteBox.Text, TtlText());
         }
 
         _rootIndex = _rootBox.SelectedIndex;
@@ -435,9 +448,10 @@ internal sealed partial class MainForm
         _loading = true;
         try
         {
-            var (folder, remote) = _draftRoots[Math.Clamp(_rootIndex, 0, _draftRoots.Count - 1)];
+            var (folder, remote, ttl) = _draftRoots[Math.Clamp(_rootIndex, 0, _draftRoots.Count - 1)];
             _folderBox.Text = folder;
             _remoteBox.Text = remote;
+            _ttlBox.Text = ttl;
         }
         finally
         {
@@ -455,7 +469,7 @@ internal sealed partial class MainForm
             return;
         }
 
-        _draftRoots[_rootIndex] = (_folderBox.Text, _remoteBox.Text);
+        _draftRoots[_rootIndex] = (_folderBox.Text, _remoteBox.Text, TtlText());
         var text = RootItemText(_draftRoots[_rootIndex]);
         if (_rootBox.SelectedIndex == _rootIndex && _rootBox.Items[_rootIndex] is { } item && (string)item != text)
         {
@@ -488,7 +502,7 @@ internal sealed partial class MainForm
     private void AddRoot()
     {
         KeepRootDraft();
-        _draftRoots.Add((DefaultFolder(), ""));
+        _draftRoots.Add((DefaultFolder(), "", ""));
         _rootIndex = _draftRoots.Count - 1;
         FillRootBox();
         LoadRootFields();
@@ -531,11 +545,11 @@ internal sealed partial class MainForm
             var saved = snapshot.Saved;
             if (saved.Roots is { Count: > 0 } list)
             {
-                _draftRoots = list.Select(root => (root.SyncRoot, root.Remote ?? "")).ToList();
+                _draftRoots = list.Select(root => (root.SyncRoot, root.Remote ?? "", root.TtlDays?.ToString() ?? "")).ToList();
             }
             else
             {
-                _draftRoots = [(saved.SyncRoot ?? snapshot.Settings.SyncRoot.Value, saved.Remote ?? "")];
+                _draftRoots = [(saved.SyncRoot ?? snapshot.Settings.SyncRoot.Value, saved.Remote ?? "", saved.Roots is { Count: > 0 } first ? first[0].TtlDays?.ToString() ?? "" : "")];
             }
 
             _rootIndex = 0;
@@ -543,6 +557,7 @@ internal sealed partial class MainForm
             var first = _draftRoots[0];
             _folderBox.Text = first.Folder;
             _remoteBox.Text = first.Remote;
+            _ttlBox.Text = first.Ttl;
             _rcUrlBox.Text = saved.RcUrl ?? DriveSettingsFile.DefaultRcUrl;
             _rcUserBox.Text = saved.RcUser ?? "";
             _rcPasswordBox.Text = UserSecret.Unprotect(saved.RcPasswordProtected) ?? "";
@@ -599,7 +614,7 @@ internal sealed partial class MainForm
     }
 
     /// <summary>Every drive in one string, so a change to any of them counts.</summary>
-    private string RootsText => string.Join("\n", _draftRoots.Select(root => $"{root.Folder}|{root.Remote}"));
+    private string RootsText => string.Join("\n", _draftRoots.Select(root => $"{root.Folder}|{root.Remote}|{root.Ttl}"));
 
     private FieldSet FieldValues => new(
         RootsText, _folderBox.Text, _remoteBox.Text, _rcUrlBox.Text, _rcUserBox.Text, _rcPasswordBox.Text, _signIn.Checked,
@@ -727,7 +742,7 @@ internal sealed partial class MainForm
         }
 
         KeepRootDraft();
-        var roots = _draftRoots.Select(root => (Folder: root.Folder.Trim(), Remote: root.Remote.Trim())).ToList();
+        var roots = _draftRoots.Select(root => (Folder: root.Folder.Trim(), Remote: root.Remote.Trim(), Ttl: root.Ttl.Trim())).ToList();
         var rcUrl = _rcUrlBox.Text.Trim();
         var rcUser = Blank(_rcUserBox.Text);
         var rcPassword = _rcPasswordBox.Text;
@@ -736,7 +751,7 @@ internal sealed partial class MainForm
         var config = Blank(_configBox.Text);
 
         string? invalid = null;
-        foreach (var (folder, remote) in roots)
+        foreach (var (folder, remote, _) in roots)
         {
             if (!Path.IsPathFullyQualified(folder))
             {
@@ -759,6 +774,10 @@ internal sealed partial class MainForm
         if (invalid is null && twice is not null)
         {
             invalid = $"Each drive needs its own folder; '{twice}' is chosen twice.";
+        }
+        else if (invalid is null && roots.Any(root => root.Ttl.Length > 0 && TtlDaysOf(root.Ttl) is null))
+        {
+            invalid = "The free-up days must be a positive whole number of days, or empty to never free files.";
         }
         else if (invalid is null && managed && program is not null && !File.Exists(program))
         {
@@ -785,7 +804,7 @@ internal sealed partial class MainForm
 
         var settings = snapshot.Saved with
         {
-            Roots = roots.Select(root => new DriveRoot(root.Folder, root.Remote)).ToList(),
+            Roots = roots.Select(root => new DriveRoot(root.Folder, root.Remote, TtlDaysOf(root.Ttl))).ToList(),
             // The first drive also in the old single-drive places, so a copy
             // from before several drives were a thing still syncs it.
             SyncRoot = roots[0].Folder,
@@ -806,7 +825,7 @@ internal sealed partial class MainForm
         // before, or a new folder that is not empty, is refused. A drive the
         // list no longer has only needs unregistering.
         var changes = new List<DriveChange>();
-        foreach (var (folder, remote) in roots)
+        foreach (var (folder, remote, _) in roots)
         {
             var current = before.Roots.FirstOrDefault(root =>
                 string.Equals(root.SyncRoot, folder, StringComparison.OrdinalIgnoreCase));
